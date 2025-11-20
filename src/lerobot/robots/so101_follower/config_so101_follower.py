@@ -39,3 +39,6 @@ class SO101FollowerConfig(RobotConfig):
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+    urdf_path: str | None = None
+    target_frame_name: str | None = None    

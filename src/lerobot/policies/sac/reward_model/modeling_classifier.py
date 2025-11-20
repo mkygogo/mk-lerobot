@@ -269,14 +269,20 @@ class Classifier(PreTrainedPolicy):
     def predict_reward(self, batch, threshold=0.5):
         """Eval method. Returns predicted reward with the decision threshold as argument."""
         # Check for both OBS_IMAGE and OBS_IMAGES prefixes
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
+        #batch = self.normalize_inputs(batch)
+        #batch = self.normalize_targets(batch)
 
         # Extract images from batch dict
         images = [batch[key] for key in self.config.input_features if key.startswith(OBS_IMAGE)]
 
+        # 🔥🔥🔥 【新增关键修复】 手动缩放数据到 [0, 1] 🔥🔥🔥
+        # 检查第一张图的最大值。如果大于 1.0，说明是原始的 [0, 255] 数据，需要缩放。
+        if len(images) > 0 and images[0].max() > 1.0:
+            images = [img.float() / 255.0 for img in images]
+
         if self.config.num_classes == 2:
             probs = self.predict(images).probabilities
+            print(f"--- 当前成功概率: {probs.item():.4f} (阈值: {threshold}) ---")
             logging.debug(f"Predicted reward images: {probs}")
             return (probs > threshold).float()
         else:

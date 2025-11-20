@@ -1,0 +1,75 @@
+diff --git a/src/lerobot/rl/gym_manipulator.py b/src/lerobot/rl/gym_manipulator.py
+index f9c9d0d7..e8fdb7f8 100644
+--- a/src/lerobot/rl/gym_manipulator.py
++++ b/src/lerobot/rl/gym_manipulator.py
+@@ -56,6 +56,7 @@ from lerobot.robots import (  # noqa: F401
+     RobotConfig,
+     make_robot_from_config,
+     so100_follower,
++    so101_follower,
+ )
+ from lerobot.robots.robot import Robot
+ from lerobot.robots.so100_follower.robot_kinematic_processor import (
+@@ -70,6 +71,7 @@ from lerobot.teleoperators import (
+     keyboard,  # noqa: F401
+     make_teleoperator_from_config,
+     so101_leader,  # noqa: F401
++    so100_leader,
+ )
+ from lerobot.teleoperators.teleoperator import Teleoperator
+ from lerobot.teleoperators.utils import TeleopEvents
+diff --git a/src/lerobot/robots/so100_follower/config_so100_follower.py b/src/lerobot/robots/so100_follower/config_so100_follower.py
+index 272b8c43..0b80fcbe 100644
+--- a/src/lerobot/robots/so100_follower/config_so100_follower.py
++++ b/src/lerobot/robots/so100_follower/config_so100_follower.py
+@@ -39,3 +39,6 @@ class SO100FollowerConfig(RobotConfig):
+ 
+     # Set to `True` for backward compatibility with previous policies/dataset
+     use_degrees: bool = False
++
++    urdf_path: str | None = None
++    target_frame_name: str | None = None
+diff --git a/src/lerobot/robots/so101_follower/config_so101_follower.py b/src/lerobot/robots/so101_follower/config_so101_follower.py
+index 03c3530c..634462de 100644
+--- a/src/lerobot/robots/so101_follower/config_so101_follower.py
++++ b/src/lerobot/robots/so101_follower/config_so101_follower.py
+@@ -39,3 +39,6 @@ class SO101FollowerConfig(RobotConfig):
+ 
+     # Set to `True` for backward compatibility with previous policies/dataset
+     use_degrees: bool = False
++
++    urdf_path: str | None = None
++    target_frame_name: str | None = None    
+diff --git a/src/lerobot/scripts/lerobot_find_joint_limits.py b/src/lerobot/scripts/lerobot_find_joint_limits.py
+index 07d57a76..0ce429ad 100644
+--- a/src/lerobot/scripts/lerobot_find_joint_limits.py
++++ b/src/lerobot/scripts/lerobot_find_joint_limits.py
+@@ -42,6 +42,7 @@ from lerobot.robots import (  # noqa: F401
+     koch_follower,
+     make_robot_from_config,
+     so100_follower,
++    so101_follower,
+ )
+ from lerobot.teleoperators import (  # noqa: F401
+     TeleoperatorConfig,
+@@ -49,6 +50,7 @@ from lerobot.teleoperators import (  # noqa: F401
+     koch_leader,
+     make_teleoperator_from_config,
+     so100_leader,
++    so101_leader,
+ )
+ from lerobot.utils.robot_utils import busy_wait
+ 
+diff --git a/src/lerobot/teleoperators/gamepad/teleop_gamepad.py b/src/lerobot/teleoperators/gamepad/teleop_gamepad.py
+index c7072f4a..3cf1e00a 100644
+--- a/src/lerobot/teleoperators/gamepad/teleop_gamepad.py
++++ b/src/lerobot/teleoperators/gamepad/teleop_gamepad.py
+@@ -106,6 +106,8 @@ class GamepadTeleop(Teleoperator):
+             gripper_action = gripper_action_map[gripper_command]
+             action_dict["gripper"] = gripper_action
+ 
++        #print(f"DEBUG Gamepad Input: {action_dict}")
++
+         return action_dict
+ 
+     def get_teleop_events(self) -> dict[str, Any]:

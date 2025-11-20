@@ -189,9 +189,15 @@ class VideoDecoderCache:
 
         with self._lock:
             if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+                # --- 原代 ---
+                # file_handle = fsspec.open(video_path).__enter__()
+                # decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                # self._cache[video_path] = (decoder, file_handle)
+                
+                # --- 新代码 ---
+                # 直接传入路径字符串，并将 file_handle 设为 None
+                decoder = VideoDecoder(video_path, seek_mode="approximate")
+                self._cache[video_path] = (decoder, None)
 
             return self._cache[video_path][0]
 
@@ -199,7 +205,8 @@ class VideoDecoderCache:
         """Clear the cache and close file handles."""
         with self._lock:
             for _, file_handle in self._cache.values():
-                file_handle.close()
+                if file_handle: # --- 新增检查 ---
+                    file_handle.close()
             self._cache.clear()
 
     def size(self) -> int:
