@@ -73,7 +73,7 @@ class InputController:
             None if episode should continue, "success" or "failure" otherwise
         """
         status = self.episode_end_status
-        self.episode_end_status = None  # Reset after reading
+        #self.episode_end_status = None  # Reset after reading
         return status
 
     def should_intervene(self):
@@ -155,8 +155,10 @@ class KeyboardController(InputController):
                     self.key_states["forward_z"] = False
                 elif key == keyboard.Key.enter:
                     self.key_states["success"] = False
+                    self.episode_end_status = None  # <--- 新增这一行：松开回车键重置状态
                 elif key == keyboard.Key.backspace:
                     self.key_states["failure"] = False
+                    self.episode_end_status = None  # <--- 新增这一行：松开退格键重置状态
             except AttributeError:
                 pass
 
@@ -263,7 +265,9 @@ class GamepadController(InputController):
 
             # Reset episode status on button release
             elif event.type == pygame.JOYBUTTONUP:
-                if event.button in [0, 2, 3]:
+                # 原代码是: if event.button in [0, 2, 3]:
+                # 修改为: 添加 1 (A键)
+                if event.button in [0, 1, 2, 3]:
                     self.episode_end_status = None
 
                 elif event.button == 6:
