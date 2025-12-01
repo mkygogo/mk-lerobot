@@ -1,0 +1,278 @@
+import pygame
+import torch
+import numpy as np
+import logging
+from dataclasses import dataclass
+import time
+
+from lerobot.teleoperators.teleoperator import Teleoperator
+from lerobot.teleoperators.config import TeleoperatorConfig
+# 引入上面的 Core
+from .mk_arm_ik_core import MKArmIKCore, CONTROL_DIR # 如果需要常量可以引
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class GamepadIKTeleopConfig(TeleoperatorConfig):
+    type: str = "gamepad_ik"
+    urdf_path: str = ""
+    mesh_dir: str = ""
+    fps: int = 60
+    visualize: bool = True
+
+class GamepadIKTeleop(Teleoperator):
+    def __init__(
+        self,
+        urdf_path: str,
+        mesh_dir: str,
+        fps: int = 60,
+        visualize: bool = True,
+        config: GamepadIKTeleopConfig = None 
+    ):
+        if config is None:
+            config = GamepadIKTeleopConfig(
+                type="gamepad_ik",
+                urdf_path=urdf_path,
+                mesh_dir=mesh_dir,
+                fps=fps,
+                visualize=visualize
+            )
+        self.config = config
+        super().__init__(config=config)
+
+        # 初始化 Core
+        self.core = MKArmIKCore(config.urdf_path, config.mesh_dir, config.visualize)
+        
+        self.x_press_start_time = None # 用于长按计时
+        self.BTN_X = 2 # Xbox 手柄 X键通常是 ID 2，请根据你的实际情况调整
+
+        #RB 键和安全锁状态
+        self.BTN_RB = 5  # Xbox 手柄 RB 键通常是 5，根据实际情况调整
+        self.rb_safety_lock = False # 防止归位后立刻误触发
+
+        self.joystick = None
+        self._init_pygame()
+
+    def _init_pygame(self):
+        pygame.init()
+        pygame.joystick.init()
+        if pygame.joystick.get_count() > 0:
+            self.joystick = pygame.joystick.Joystick(0)
+            self.joystick.init()
+            logger.info(f"🎮 Teleop: Connected to {self.joystick.get_name()}")
+        else:
+            logger.warning("⚠️ Teleop: No Joystick found!")
+
+    # --- 映射逻辑 (参考 SixDofSim._get_inputs) ---
+    def _get_inputs(self):
+        xyz_delta = np.zeros(3)
+        manual = {'j4':0, 'j5':0, 'j6':0, 'gripper':0}
+        
+        if not self.joystick: return xyz_delta, manual
+
+        # 死区过滤
+        def filter_stick(val):
+            return 0.0 if abs(val) < 0.15 else val
+
+        # 读取轴 (Xbox Mapping)
+        # 注意：这里请根据你实际手柄 ID 调整，参考你的原脚本
+        lx = filter_stick(self.joystick.get_axis(0)) # AXIS_LX
+        ly = filter_stick(self.joystick.get_axis(1)) # AXIS_LY
+        rx = filter_stick(self.joystick.get_axis(3)) # AXIS_RX
+        ry = filter_stick(self.joystick.get_axis(4)) # AXIS_RY
+        hat = self.joystick.get_hat(0)
+
+        # 你的控制方向定义
+        # 'IK_X': -1.0, 'IK_Y': 1.0, 'IK_Z': -1.0
+        # TRANS_SPEED 已经在 Core 里定义了，这里我们传 Normalized 值?
+        # 不，你的 Arm.update 期望的是 delta 距离。
+        # 所以这里要乘速度。
+        
+        # 为了保持一致，我们在 Core 里没有把 TRANS_SPEED 变成 global 常量，
+        # 而是 Arm.update 接收 xyz_delta。
+        # 我们可以把 TRANS_SPEED 定义在 Core 的 global 里，或者这里硬编码。
+        TRANS_SPEED = 0.002
+        
+        xyz_delta[0] = -1.0 * lx * TRANS_SPEED # IK_X
+        xyz_delta[1] =  1.0 * ly * TRANS_SPEED # IK_Y
+        xyz_delta[2] = -1.0 * ry * TRANS_SPEED # IK_Z
+        
+        manual['j4'] = -hat[1]
+        manual['j5'] = -rx
+        manual['j6'] = -hat[0]
+        
+        # 夹爪
+        lt_val = (self.joystick.get_axis(2) + 1) / 2
+        rt_val = (self.joystick.get_axis(5) + 1) / 2
+        if rt_val > 0.1: manual['gripper'] = 1
+        elif lt_val > 0.1: manual['gripper'] = -1
+        
+        return xyz_delta, manual
+
+    # --- LeRobot 接口 ---
+    @property
+    def name(self) -> str: 
+        return self.config.type
+    
+    def connect(self): 
+        if not self.joystick: 
+            self._init_pygame()
+    
+    def disconnect(self): 
+        pygame.quit()
+    
+    @property
+    def is_connected(self) -> bool: 
+        return self.joystick is not None
+    
+    @property
+    def is_calibrated(self) -> bool: 
+        return True
+
+    def calibrate(self): 
+        pass
+
+    def configure(self, config): 
+        pass
+    
+    @property
+    def action_features(self):
+        return {"action": {"dtype": "float32", "shape": (7,), "names": ["joint_1","joint_2","joint_3","joint_4","joint_5","joint_6","gripper"]}}
+    
+    @property
+    def feedback_features(self): 
+        return None
+    
+    def send_feedback(self, feedback): 
+        pass
+
+    def get_action(self, observation: dict) -> torch.Tensor:
+        pygame.event.pump()
+        
+        # ========================================================
+        # 1. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
+        # ========================================================
+        
+        # 获取物理按键状态
+        phys_rb_pressed = (self.joystick.get_button(self.BTN_RB) == 1)
+        
+        # 处理安全锁：如果锁着，必须先松手才能解锁
+        if self.rb_safety_lock:
+            if not phys_rb_pressed:
+                self.rb_safety_lock = False # 解锁
+                logger.info("🔓 Safety Lock Disengaged (RB Released)")
+            effective_rb = False # 锁定期强制视为没按
+        else:
+            effective_rb = phys_rb_pressed
+
+        # ========================================================
+        # 2. X键 长按归位检测 (最高优先级)
+        # ========================================================
+        if self.joystick.get_button(self.BTN_X):
+            if self.x_press_start_time is None:
+                self.x_press_start_time = time.time()
+            elif time.time() - self.x_press_start_time > 2.0: 
+                self.core.start_homing()
+        else:
+            self.x_press_start_time = None
+
+        # ========================================================
+        # 3. 归位模式执行 (Homing Mode)
+        # ========================================================
+        if self.core.is_homing:
+            action_array = self.core.step_homing()
+            
+            # [关键] 检测归位是否刚刚结束
+            # 如果这一步跑完，Core 里的标志位变 False 了，说明刚结束 -> 上锁
+            if not self.core.is_homing:
+                self.rb_safety_lock = True
+                logger.info("🔒 Safety Lock Engaged (Homing Complete)")
+                
+            return torch.from_numpy(action_array).float()
+
+        # ========================================================
+        # 4. 常规控制模式 (HIL-SERL)
+        # ========================================================
+        
+        # 获取手柄输入
+        xyz_delta, manual = self._get_inputs()
+        
+        # [逻辑修改] 真机模式下，必须按住 RB 才算介入 (Active)，否则为同步 (Passive)
+        # 纯仿真模式下 (没有 observation)，总是视为 Active
+        
+        if "observation.state" in observation:
+            # --- 真机 / Gym 环境 ---
+            current_state = observation["observation.state"]
+            if isinstance(current_state, torch.Tensor):
+                current_state = current_state.cpu().numpy()
+
+            if effective_rb:
+                # [主动控制] 按住了 RB -> 允许 IK 计算和移动
+                # 即使摇杆不动，这里也应该调用 step，保持 IK 目标点稳定（Hold）
+                action_array = self.core.step(xyz_delta, manual)
+            else:
+                # [被动跟随] 没按 RB -> 强制同步真机状态
+                # 此时手柄输入被忽略，虚拟臂吸附在真机上
+                self.core.set_state_from_hardware(current_state)
+                action_array = current_state
+        else:
+            # --- 纯仿真模式 (Sim Only) ---
+            # 这种模式下通常没有 observation，我们允许直接控制，不需要按 RB
+            # 或者如果你希望统一习惯，也可以加上 if effective_rb 的判断
+            action_array = self.core.step(xyz_delta, manual)
+
+        return torch.from_numpy(action_array).float()
+
+    # def get_action(self, observation: dict) -> torch.Tensor:
+    #     pygame.event.pump()
+
+    #     # X键 长按归位检测
+    #     if self.joystick.get_button(self.BTN_X):
+    #         if self.x_press_start_time is None:
+    #             self.x_press_start_time = time.time()
+    #         elif time.time() - self.x_press_start_time > 2.0: # 长按 2秒
+    #             self.core.start_homing()
+    #     else:
+    #         self.x_press_start_time = None
+
+    #     #归位模式优先执行
+    #     if self.core.is_homing:
+    #         # 如果正在归位，无视任何手柄输入，无视真机同步
+    #         action_array = self.core.step_homing()
+    #         return torch.from_numpy(action_array).float()
+
+    #     xyz_delta, manual = self._get_inputs()
+        
+    #     #判断是否有人工介入 (Intervention Check)
+    #     # 只要有任何移动意图，就算介入
+    #     is_intervening = (np.linalg.norm(xyz_delta) > 1e-6) or \
+    #                      (any(v != 0 for v in manual.values()))
+
+    #     # [HIL-SERL 核心逻辑]
+    #     # 情况 A: 存在环境反馈 (连接了真机 或 在 Gym 仿真环境中)
+    #     # 对应原脚本的 "Real Mode"
+    #     if "observation.state" in observation:
+    #         current_state = observation["observation.state"]
+    #         if isinstance(current_state, torch.Tensor):
+    #             current_state = current_state.cpu().numpy()
+
+    #         if is_intervening:
+    #             # [主动介入] 
+    #             # 人正在控制 -> 运行 IK 积分 (基于 Core 内部的上一帧状态继续走)
+    #             # 这对应原脚本：rb_pressed == True
+    #             action_array = self.core.step(xyz_delta, manual)
+    #         else:
+    #             # [被动跟随] 
+    #             # 人没动 -> 强制同步 Core 状态到真机 -> 返回真机当前状态
+    #             # 这对应原脚本：rb_pressed == False -> set_state_from_hardware
+    #             self.core.set_state_from_hardware(current_state)
+    #             action_array = current_state
+
+    #     # 情况 B: 无环境反馈 (纯手柄测试 / 纯可视化调试)
+    #     # 对应原脚本的 "Sim Only Mode"
+    #     else:
+    #         # 无论动没动，都运行 IK 积分
+    #         # 这样你在没有真机的情况下，也能用手柄控制虚拟臂动起来
+    #         action_array = self.core.step(xyz_delta, manual)
+        
+    #     return torch.from_numpy(action_array).float()
