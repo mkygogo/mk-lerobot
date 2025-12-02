@@ -53,8 +53,15 @@ class GamepadIKTeleop(Teleoperator):
         self.BTN_RB = 5  # Xbox 手柄 RB 键通常是 5，根据实际情况调整
         self.rb_safety_lock = False # 防止归位后立刻误触发
 
+        #用于记录上一帧 RB 状态，实现上升沿检测
+        self.prev_rb_state = False
+
         self.joystick = None
         self._init_pygame()
+
+        #启动同步标志位
+        # 只要这个是 False，说明还没有根据真机状态初始化过
+        self.has_synced_startup = False
 
     def _init_pygame(self):
         pygame.init()
@@ -156,10 +163,23 @@ class GamepadIKTeleop(Teleoperator):
     def get_action(self, observation: dict) -> torch.Tensor:
         pygame.event.pump()
         
+        #启动时的首帧强制同步 (接口层安全保障)
+        # 这确保了无论什么脚本调用，第一帧永远是“吸附”在真机当前位置的，绝对不会跳变
+        if "observation.state" in observation:
+            current_state = observation["observation.state"]
+            if isinstance(current_state, torch.Tensor):
+                current_state = current_state.cpu().numpy()
+
+            if not self.has_synced_startup:
+                self.core.set_state_from_hardware(current_state)
+                self.has_synced_startup = True
+                logger.info("🛡️ Safety: Teleop first-frame synced with hardware.")
+                # 直接返回当前状态，跳过后续所有计算，确保绝对静止
+                return torch.from_numpy(current_state).float()
+
         # ========================================================
         # 1. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
         # ========================================================
-        
         # 获取物理按键状态
         phys_rb_pressed = (self.joystick.get_button(self.BTN_RB) == 1)
         
@@ -214,14 +234,20 @@ class GamepadIKTeleop(Teleoperator):
                 current_state = current_state.cpu().numpy()
 
             if effective_rb:
+                #刚按下 RB 的瞬间，同步一次真机位置，防止跳变
+                if not self.prev_rb_state:
+                    self.core.set_state_from_hardware(current_state)
+                    logger.info("🎮 Active Control Engaged: Synced with Hardware")
                 # [主动控制] 按住了 RB -> 允许 IK 计算和移动
                 # 即使摇杆不动，这里也应该调用 step，保持 IK 目标点稳定（Hold）
                 action_array = self.core.step(xyz_delta, manual)
             else:
-                # [被动跟随] 没按 RB -> 强制同步真机状态
-                # 此时手柄输入被忽略，虚拟臂吸附在真机上
-                self.core.set_state_from_hardware(current_state)
-                action_array = current_state
+                # 没按 RB
+                # 旧代码：self.core.set_state_from_hardware(current_state) -> 导致震荡发热
+                # 新代码：发送全0的 delta，让 IK Core 保持输出上一次的稳定目标值
+                action_array = self.core.step(np.zeros(3), {})
+            
+            self.prev_rb_state = effective_rb # 更新状态
         else:
             # --- 纯仿真模式 (Sim Only) ---
             # 这种模式下通常没有 observation，我们允许直接控制，不需要按 RB

@@ -213,9 +213,13 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
         for key, value in frame.items():
             if key in ("task_index", "timestamp", "episode_index", "frame_index", "index", "task"):
                 continue
-            if key in (DONE, REWARD):
-                # if not isinstance(value, str) and len(value.shape) == 0:
-                value = value.unsqueeze(0)
+            # if key in (DONE, REWARD):
+            #     # if not isinstance(value, str) and len(value.shape) == 0:
+            #     value = value.unsqueeze(0)
+            #只有当数据是标量(dim=0)时才升维，如果是(1,)则保持不变
+            if key in (DONE, REWARD, "next.success"):
+                if isinstance(value, torch.Tensor) and value.dim() == 0:
+                    value = value.unsqueeze(0)
 
             if key in crop_params_dict:
                 top, left, height, width = crop_params_dict[key]
@@ -324,3 +328,8 @@ if __name__ == "__main__":
 
     with open(meta_dir / "crop_params.json", "w") as f:
         json.dump(rois, f, indent=4)
+
+    #显式完成数据集写入，防止 Python 关闭时崩溃
+    print("💾 Finalizing dataset to ensure all metadata is saved...")
+    cropped_resized_dataset.finalize()
+    print("✅ Done!")

@@ -247,12 +247,22 @@ class SixDofArm:
         n = min(len(self.q), len(q_real))
         self.q[:n] = q_real[:n]
         
+        #夹爪单位换算 (归一化 0~1 -> 物理单位 0~0.04)
+        # 如果不乘这个系数，仿真器会认为夹爪在“几米”远的地方，导致归位时动作长时间卡在最大值。
+        if n > 6:
+            # 假设 q[6] 是夹爪，且最大物理行程是 0.04 (与 step() 中的 clip 对应)
+            self.q[6] = q_real[6] * 0.04
+
         pin.framesForwardKinematics(self.model, self.data, self.q)
         self.target_pos = self.data.oMf[self.ik_frame_id].translation.copy()
         self.valid_target_pos = self.target_pos.copy()
         
         self.ik_solver.q_ref_3dof = self.q[:3].copy()
-        self.in_zero_mode = False
+        
+        # [🚨 严重错误修复] 原来是 False，导致瞬间触发限位跳变
+        # 改为 True，表示"当前状态是受信任的初始状态，暂时忽略限位检查"
+        # 只有当用户推摇杆(has_input)时，update() 才会自动将其设为 False 并开始限位
+        self.in_zero_mode = True
 
     def update(self, xyz_delta, manual_controls, dt=0.1):
         """ 完全保留你的 update 逻辑 (包含 Safety Clamping, Smoothing, IK) """
@@ -413,12 +423,21 @@ class MKArmIKCore:
                     f"Tgt:[{self.arm.target_pos[0]:.3f}, {self.arm.target_pos[1]:.3f}, {self.arm.target_pos[2]:.3f}] | "
                     f"J:[{self.arm.q[0]:.2f}, {self.arm.q[1]:.2f}, {self.arm.q[2]:.2f}, "
                     f"{self.arm.q[3]:.2f}, {self.arm.q[4]:.2f}, {self.arm.q[5]:.2f}]")
-        # 触发条件：每20帧 OR 发生发散错误
-        if self.log_counter % 20 == 0 or "Diverged" in debug_msg or "BLOCKED" in debug_msg:
+        
+        # 智能日志过滤逻辑
+        # 1. 总是打印: 发生发散(Diverged) 或 卡死(BLOCKED)
+        # 2. 正常打印: 不在 Zero Mode 时，每 20 帧打印一次 (保持原频率)
+        # 3. 静默模式: 在 Zero Mode 时，每 600 帧 (约20秒) 才打印一次心跳，避免刷屏
+        is_error = "Diverged" in debug_msg or "BLOCKED" in debug_msg
+        is_active = not self.arm.in_zero_mode
+        should_log = is_error or \
+                     (is_active and self.log_counter % 20 == 0) or \
+                     (not is_active and self.log_counter % 600 == 0)
+
+        if should_log:
             logger.info(info_str)
-            force_flush_log() # 强制写入硬盘
-            # 如果在终端运行，也可以打印出来看
-            print(info_str, end='\r')        
+            force_flush_log()
+            print(info_str, end='\r')   
 
         # 提取前 6 个关节
         action = self.arm.q[:6].copy()
