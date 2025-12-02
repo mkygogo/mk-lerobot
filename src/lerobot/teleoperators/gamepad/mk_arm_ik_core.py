@@ -154,7 +154,7 @@ class ThreeDofIKSolver:
 # 2. 6自由度仿真臂 (移植，微调路径加载)
 # ==========================================
 class SixDofArm:
-    def __init__(self, urdf_path, mesh_dir):
+    def __init__(self, urdf_path, mesh_dir, ik_config=None):
         # 路径处理：确保是绝对路径
         self.urdf_path = str(Path(urdf_path).resolve()) if Path(urdf_path).exists() else urdf_path
         self.mesh_dir = str(Path(mesh_dir).resolve()) if Path(mesh_dir).exists() else mesh_dir
@@ -162,7 +162,20 @@ class SixDofArm:
         self.model, self.collision_model, self.visual_model = self._load_model(self.urdf_path, self.mesh_dir)
         self.data = self.model.createData()
         
-        # [关键配置] 你的原版限位
+        # 解析 IK 配置 (矩形限位)
+        self.ee_bounds_min = None
+        self.ee_bounds_max = None
+        target_frame_name = "link4" # 默认
+
+        if ik_config:
+            target_frame_name = ik_config.get("target_frame_name", "link4")
+            if "end_effector_bounds" in ik_config:
+                bounds = ik_config["end_effector_bounds"]
+                self.ee_bounds_min = np.array(bounds.get("min", [-10, -10, -10]))
+                self.ee_bounds_max = np.array(bounds.get("max", [10, 10, 10]))
+                logger.info(f"📦 EE Bounds Set: Min={self.ee_bounds_min}, Max={self.ee_bounds_max}")
+
+        # joints限位
         self.joint_limits = [
             [-3.0, 3.0],   # J1
             [-0.3, 3.0],   # J2
@@ -175,7 +188,9 @@ class SixDofArm:
         
         if self.model.existFrame("link4"):
             self.ik_frame_id = self.model.getFrameId("link4")
+            logger.info(f"🎯 IK Target Frame: {target_frame_name} (ID: {self.ik_frame_id})")
         else:
+            logger.warning(f"⚠️ Frame '{target_frame_name}' not found! Using 'link3'.")
             self.ik_frame_id = self.model.getFrameId("link3")
             
         self.ik_solver = ThreeDofIKSolver(self.model, self.data, self.ik_frame_id, self.joint_limits[:3])
@@ -183,8 +198,6 @@ class SixDofArm:
         # 初始化姿态 (保持你的初始值)
         # 自动适配关节数量 (防止8轴报错)
         self.q = pin.neutral(self.model)
-        
-        # 你的预设值
         init_vals = [0.020, 1.671, -0.670, -1.20, 0.0, 0.0]
         n_copy = min(len(init_vals), self.model.nq)
         self.q[:n_copy] = init_vals[:n_copy]
@@ -276,14 +289,24 @@ class SixDofArm:
         ideal_pos = self.target_pos.copy()
 
         if not self.in_zero_mode:
-            # --- 你的安全限制逻辑 ---
-            if ideal_pos[1] > MAX_Y: ideal_pos[1] = MAX_Y
-            if ideal_pos[2] < MIN_JOINT4_Z: ideal_pos[2] = MIN_JOINT4_Z
+            # 矩形盒限位 (新增)
+            if self.ee_bounds_min is not None and self.ee_bounds_max is not None:
+                ideal_pos = np.clip(ideal_pos, self.ee_bounds_min, self.ee_bounds_max)
+                if not np.array_equal(ideal_pos, self.target_pos):
+                    clamped_msg = "🔒 BoxLimit"
+
+            #原有的球形和圆柱限位
+            if ideal_pos[1] > MAX_Y: 
+                ideal_pos[1] = MAX_Y
+            if ideal_pos[2] < MIN_JOINT4_Z: 
+                ideal_pos[2] = MIN_JOINT4_Z
             
             xy_dist = np.linalg.norm(ideal_pos[:2])
             if xy_dist < MIN_RADIUS_XY:
-                if xy_dist < 1e-6: ideal_pos[:2] = [0, -MIN_RADIUS_XY]
-                else: ideal_pos[:2] *= (MIN_RADIUS_XY / xy_dist)
+                if xy_dist < 1e-6: 
+                    ideal_pos[:2] = [0, -MIN_RADIUS_XY]
+                else: 
+                    ideal_pos[:2] *= (MIN_RADIUS_XY / xy_dist)
             
             dist = np.linalg.norm(ideal_pos)
             if dist > MAX_RADIUS:
@@ -325,7 +348,7 @@ class MKArmIKCore:
     这个类作为 'SixDofSim' 的替代品。
     它负责初始化 Arm，处理 Meshcat，并提供 step() 接口。
     """
-    def __init__(self, urdf_path, mesh_dir, visualize=True):
+    def __init__(self, urdf_path, mesh_dir, visualize=True, ik_config=None):
         self.arm = SixDofArm(urdf_path, mesh_dir)
         self.visualize = visualize
         self.viz = None
@@ -348,7 +371,6 @@ class MKArmIKCore:
             self.viz.loadViewerModel()
             self.viz.display(self.arm.q)
             
-            # --- 你的可视化元素 ---
             self.viz.viewer["target"].set_object(g.Sphere(0.04), g.MeshBasicMaterial(color=0xff0000, opacity=0.8))
             self.viz.viewer["workspace_outer"].set_object(g.Sphere(MAX_RADIUS), 
                                             g.MeshBasicMaterial(color=0xffffff, opacity=1, wireframe=True))
@@ -356,6 +378,14 @@ class MKArmIKCore:
             self.viz.viewer["workspace_inner"].set_object(cyl_geom, 
                                             g.MeshBasicMaterial(color=0xff0000, opacity=1, wireframe=False))
             self.viz.viewer["workspace_inner"].set_transform(np.array([[1,0,0,0],[0,0,-1,0],[0,1,0,0.2],[0,0,0,1]]))
+            
+            # 可视化矩形安全盒
+            if self.arm.ee_bounds_min is not None:
+                center = (self.arm.ee_bounds_min + self.arm.ee_bounds_max) / 2
+                dims = self.arm.ee_bounds_max - self.arm.ee_bounds_min
+                self.viz.viewer["safety_box"].set_object(g.Box(dims), g.MeshBasicMaterial(color=0x00ff00, opacity=0.1, wireframe=True))
+                self.viz.viewer["safety_box"].set_transform(pin.SE3(np.eye(3), center).homogeneous)
+
             logger.info("✨ Meshcat Initialized")
         except Exception as e:
             logger.warning(f"Meshcat Init Failed: {e}")
@@ -393,14 +423,6 @@ class MKArmIKCore:
         # 提取前 6 个关节
         action = self.arm.q[:6].copy()
         
-        # 提取夹爪 (假设 q[6] 是 gripper)
-        # 注意：你的 SixDofArm 里夹爪控制逻辑写入了 q[6] (0.0~0.04)
-        # 我们需要把它标准化为 0.0~1.0 返回给 LeRobot 吗？
-        # 通常 LeRobot 里的 gripper 是 0~1。
-        # 你的 SixDofRealArm 里有: g_norm = (1.0 - g_real) * 0.04
-        # 所以 normalized_gripper = 1.0 - (q[6] / 0.04)
-        # 但为了简单，如果你的 mk_robot 接收的是 q[6] 原值，这里就传原值。
-        # 假设我们传归一化的值：
         gripper_raw = self.arm.q[6]
         gripper_norm = np.clip(gripper_raw / 0.04, 0.0, 1.0) # 0=Close, 1=Open? 
         # 你的代码里：q[6] += delta (Open方向)

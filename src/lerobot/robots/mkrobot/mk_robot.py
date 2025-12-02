@@ -35,6 +35,7 @@ class MKRobot(Robot):
         super().__init__(config)
         self.config = config
         
+        self.cameras = {}
         if MKFollowerConfig is None:
             raise ImportError("Could not import follower_mkarm. Please ensure it is in the python path.")
 
@@ -47,15 +48,25 @@ class MKRobot(Robot):
         self.robot = MKFollower(self.follower_config)
         self.is_connected_flag = False
 
+
     def connect(self):
         if not self.is_connected_flag:
             logger.info(f"🔗 MKRobot: Connecting to {self.config.port}...")
             self.robot.connect()
+            #连接所有摄像头
+            for name, cam in self.cameras.items():
+                logger.info(f"📷 Connecting camera: {name}")
+                cam.connect()
+
             self.is_connected_flag = True
             logger.info("✅ MKRobot: Connected!")
 
     def disconnect(self):
         if self.is_connected_flag:
+            #断开所有摄像头
+            for name, cam in self.cameras.items():
+                cam.disconnect()
+
             self.robot.disconnect()
             self.is_connected_flag = False
 
@@ -100,6 +111,17 @@ class MKRobot(Robot):
             # 如果你也返回速度，可以在这里加上
             # "observation.velocity": { ... }
         }
+
+    def capture_images(self) -> Dict[str, Any]:
+        """读取所有已连接摄像头的图像"""
+        images = {}
+        for name, camera in self.cameras.items():
+            # 优先尝试异步读取以提高帧率，如果不支持则使用普通读取
+            if hasattr(camera, "async_read"):
+                images[name] = camera.async_read()
+            else:
+                images[name] = camera.read()
+        return images
 
     # =========================================================
     # 🕹️ 核心收发逻辑
