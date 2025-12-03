@@ -1,12 +1,14 @@
 import numpy as np
 import torch
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Any
 
 from lerobot.robots.robot import Robot
 from lerobot.robots.config import RobotConfig
-# 假设 follower_mkarm 库可用
+from lerobot.cameras.configs import CameraConfig
+from lerobot.cameras.opencv import OpenCVCamera
+
 try:
     from lerobot.robots.mkrobot.follower_mkarm import MKFollower, MKFollowerConfig 
 except ImportError:
@@ -20,12 +22,48 @@ logger = logging.getLogger(__name__)
 # Sim (URDF) <-> Real (Motor)
 HARDWARE_DIR = np.array([-1.0, 1.0, -1.0, -1.0, -1.0, -1.0]) # 前6轴
 
+class MKBusAdapter:
+    """
+    伪装成 DynamixelBus，为 gym_manipulator 提供 sync_read/write 接口。
+    同时确保复位操作经过 MKRobot 的坐标转换，保证方向安全。
+    """
+    def __init__(self, mk_robot):
+        self.mk_robot = mk_robot # 持有 MKRobot 实例以便调用其 send_action/get_observation
+        self.names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+
+    @property
+    def motors(self):
+        # 返回电机字典，用于获取键名列表
+        return self.mk_robot.robot.motors
+
+    def sync_read(self, prop):
+        if prop == "Present_Position":
+            # 使用 MKRobot.get_observation 获取经过 Sim 坐标转换后的状态
+            obs = self.mk_robot.get_observation()
+            state = obs['observation.state'].cpu().numpy()
+            
+            # 将数组重新映射回字典 {joint_name: value}
+            return {name: float(val) for name, val in zip(self.names, state)}
+        return {}
+
+    def sync_write(self, prop, values):
+        if prop == "Goal_Position":
+            # values 是 {joint_name: val} (Sim 坐标系)
+            # 转换为数组并调用 MKRobot.send_action (它会自动处理 Sim->Real 转换)
+            target = np.zeros(7, dtype=np.float32)
+            for i, name in enumerate(self.names):
+                if name in values:
+                    target[i] = values[name]
+            
+            self.mk_robot.send_action(target)
+
 @RobotConfig.register_subclass("mk_robot")
 @dataclass
 class MKRobotConfig(RobotConfig):
     type: str = "mk_robot"
     port: str = "/dev/ttyACM0"
     joint_velocity_scaling: float = 1.0
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
 class MKRobot(Robot):
     config_class = MKRobotConfig
@@ -35,7 +73,15 @@ class MKRobot(Robot):
         super().__init__(config)
         self.config = config
         
+        #手动初始化相机列表
         self.cameras = {}
+        for name, cam_config in config.cameras.items():
+            # 这里的 cam_config 已经是通过 draccus 解析好的配置对象
+            if cam_config.type == "opencv":
+                self.cameras[name] = OpenCVCamera(cam_config)
+            else:
+                logger.warning(f"⚠️ MKRobot 目前仅显式支持 'opencv' 类型相机，跳过: {name} ({cam_config.type})")
+
         if MKFollowerConfig is None:
             raise ImportError("Could not import follower_mkarm. Please ensure it is in the python path.")
 
@@ -48,6 +94,7 @@ class MKRobot(Robot):
         self.robot = MKFollower(self.follower_config)
         self.is_connected_flag = False
 
+        self._bus_adapter = MKBusAdapter(self)
 
     def connect(self):
         if not self.is_connected_flag:
@@ -74,6 +121,10 @@ class MKRobot(Robot):
     def is_connected(self):
         return self.is_connected_flag
 
+    @property
+    def bus(self):
+        # 返回适配器而不是底层驱动
+        return self._bus_adapter
 
     @property
     def is_calibrated(self):
@@ -185,7 +236,27 @@ class MKRobot(Robot):
         # 假设真机返回 0.0~1.0
         g_real = raw_obs.get('gripper.pos', 0)
         q_sim[6] = g_real
+        
+        images = self.capture_images()
 
-        return {
+        # 必须包含: 
+        #   - 独立的 joint_x.pos (供 GymEnv 读取)
+        #   - 图像 (供 GymEnv 读取)
+        #   - observation.state (供 Policy 使用)
+        
+        obs_dict = {
             "observation.state": torch.from_numpy(q_sim).float(),
+            # 显式填入 GymEnv 需要的键名
+            "joint_1.pos": q_sim[0],
+            "joint_2.pos": q_sim[1],
+            "joint_3.pos": q_sim[2],
+            "joint_4.pos": q_sim[3],
+            "joint_5.pos": q_sim[4],
+            "joint_6.pos": q_sim[5],
+            "gripper.pos": q_sim[6],
         }
+
+        # 合并图像数据到字典中
+        obs_dict.update(images)
+
+        return obs_dict

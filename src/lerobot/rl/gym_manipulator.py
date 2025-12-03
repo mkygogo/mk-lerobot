@@ -79,6 +79,13 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import log_say
 
+try:
+    from lerobot.robots.mkrobot.mk_robot import MKRobotConfig
+    from lerobot.teleoperators.gamepad.gamepad_ik_teleop import GamepadIKTeleopConfig
+    print("✅ 已成功注册 MKRobot 和 GamepadIK")
+except ImportError as e:
+    print(f"⚠️ 注册 MKRobot/GamepadIK 失败 (如果不是用这两个硬件可忽略): {e}")
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -142,7 +149,8 @@ class RobotEnv(gym.Env):
         super().__init__()
 
         self.robot = robot
-        self.display_cameras = display_cameras
+        #self.display_cameras = display_cameras
+        self.display_cameras = False
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -280,15 +288,15 @@ class RobotEnv(gym.Env):
 
     def render(self) -> None:
         """Display robot camera feeds."""
-        import cv2
+        #import cv2
 
         current_observation = self._get_observation()
-        if current_observation is not None:
-            image_keys = [key for key in current_observation if "image" in key]
+        # if current_observation is not None:
+        #     image_keys = [key for key in current_observation if "image" in key]
 
-            for key in image_keys:
-                cv2.imshow(key, cv2.cvtColor(current_observation[key].numpy(), cv2.COLOR_RGB2BGR))
-                cv2.waitKey(1)
+        #     for key in image_keys:
+        #         cv2.imshow(key, cv2.cvtColor(current_observation[key].numpy(), cv2.COLOR_RGB2BGR))
+        #         cv2.waitKey(1)
 
     def close(self) -> None:
         """Close environment and disconnect robot."""
@@ -822,6 +830,22 @@ def control_loop(
             env_processor=env_processor,
             action_processor=action_processor,
         )
+        #实时打印图像统计信息 
+        # 从 transition 中获取处理过的观测数据 (这是喂给 Reward Model 的数据)
+        proc_obs = transition[TransitionKey.OBSERVATION]
+        
+        stats_msg = []
+        for key, value in proc_obs.items():
+            if "image" in key and isinstance(value, torch.Tensor):
+                # value通常是 (Batch, Channel, Height, Width) 或 (C, H, W)
+                v_min = value.min().item()
+                v_max = value.max().item()
+                v_shape = list(value.shape)
+                stats_msg.append(f"{key}: {v_shape} [{v_min:.2f}, {v_max:.2f}]")
+        
+        # 打印在同一行 (加上之前的 episode 信息)
+        print(f"Epi: {episode_idx} | Reward: {transition[TransitionKey.REWARD].item():.4f} | {' | '.join(stats_msg)}", end="\r")
+
         terminated = transition.get(TransitionKey.DONE, False)
         truncated = transition.get(TransitionKey.TRUNCATED, False)
 

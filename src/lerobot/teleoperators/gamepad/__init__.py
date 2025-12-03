@@ -16,3 +16,4 @@
 
 from .configuration_gamepad import GamepadTeleopConfig
 from .teleop_gamepad import GamepadTeleop
+from .gamepad_ik_teleop import GamepadIKTeleop, GamepadIKTeleopConfig

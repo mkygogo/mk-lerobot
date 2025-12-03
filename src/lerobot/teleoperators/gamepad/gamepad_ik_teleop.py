@@ -8,10 +8,12 @@ from typing import Dict, Optional
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.teleoperators.utils import TeleopEvents
 from .mk_arm_ik_core import MKArmIKCore
 
 logger = logging.getLogger(__name__)
 
+@TeleoperatorConfig.register_subclass("gamepad_ik")
 @dataclass
 class GamepadIKTeleopConfig(TeleoperatorConfig):
     type: str = "gamepad_ik"
@@ -20,32 +22,45 @@ class GamepadIKTeleopConfig(TeleoperatorConfig):
     fps: int = 60
     visualize: bool = True
     inverse_kinematics: Optional[Dict] = field(default_factory=dict)
+    trans_speed: float = 0.002
+    rot_speed: float = 0.02
 
 class GamepadIKTeleop(Teleoperator):
     def __init__(
         self,
-        urdf_path: str,
-        mesh_dir: str,
+        config: GamepadIKTeleopConfig = None,
+        urdf_path: str = None,
+        mesh_dir: str = None,
         fps: int = 60,
         visualize: bool = True,
-        inverse_kinematics: dict = None,
-        config: GamepadIKTeleopConfig = None 
+        inverse_kinematics: dict = None
     ):
-        if config is None:
-            config = GamepadIKTeleopConfig(
+        
+        if config is not None:
+            self.config = config
+        else:
+            if urdf_path is None or mesh_dir is None:
+                raise ValueError("GamepadIKTeleop: If 'config' is not provided, 'urdf_path' and 'mesh_dir' are required.")
+            
+            self.config = GamepadIKTeleopConfig(
                 type="gamepad_ik",
                 urdf_path=urdf_path,
                 mesh_dir=mesh_dir,
                 fps=fps,
                 visualize=visualize,
-                inverse_kinematics=inverse_kinematics or {}
+                inverse_kinematics=inverse_kinematics or {},
+                # 记得加上这两个默认值，防止报错
+                trans_speed=0.002, 
+                rot_speed=0.02
             )
-        self.config = config
+        
         super().__init__(config=config)
 
         # 初始化 Core
-        self.core = MKArmIKCore(config.urdf_path, config.mesh_dir, 
-                                config.visualize, ik_config=config.inverse_kinematics)
+        self.core = MKArmIKCore(self.config.urdf_path, 
+            self.config.mesh_dir, 
+            self.config.visualize, 
+            ik_config=self.config.inverse_kinematics)
         
         self.x_press_start_time = None # 用于长按计时
         self.BTN_X = 2 # Xbox 手柄 X键通常是 ID 2，请根据你的实际情况调整
@@ -55,6 +70,9 @@ class GamepadIKTeleop(Teleoperator):
 
         #用于记录上一帧 RB 状态，实现上升沿检测
         self.prev_rb_state = False
+
+        #状态标志位，用于 get_teleop_events
+        self.is_active = False
 
         self.joystick = None
         self._init_pygame()
@@ -103,7 +121,7 @@ class GamepadIKTeleop(Teleoperator):
         # 为了保持一致，我们在 Core 里没有把 TRANS_SPEED 变成 global 常量，
         # 而是 Arm.update 接收 xyz_delta。
         # 我们可以把 TRANS_SPEED 定义在 Core 的 global 里，或者这里硬编码。
-        TRANS_SPEED = 0.002
+        TRANS_SPEED = self.config.trans_speed
         
         xyz_delta[0] = -1.0 * lx * TRANS_SPEED # IK_X
         xyz_delta[1] =  1.0 * ly * TRANS_SPEED # IK_Y
@@ -160,6 +178,15 @@ class GamepadIKTeleop(Teleoperator):
     def send_feedback(self, feedback): 
         pass
 
+    def get_teleop_events(self):
+        """
+        返回当前遥操作事件状态。
+        gym_manipulator 必须调用此方法来判断是否处于人工干预模式。
+        """
+        return {
+            TeleopEvents.IS_INTERVENTION: self.is_active
+        }
+
     def get_action(self, observation: dict) -> torch.Tensor:
         pygame.event.pump()
         
@@ -188,9 +215,10 @@ class GamepadIKTeleop(Teleoperator):
             if not phys_rb_pressed:
                 self.rb_safety_lock = False # 解锁
                 logger.info("🔓 Safety Lock Disengaged (RB Released)")
-            effective_rb = False # 锁定期强制视为没按
+            # 锁定期强制视为没按
+            self.is_active = False
         else:
-            effective_rb = phys_rb_pressed
+            self.is_active = phys_rb_pressed
 
         # ========================================================
         # 2. X键 长按归位检测 (最高优先级)
@@ -233,7 +261,7 @@ class GamepadIKTeleop(Teleoperator):
             if isinstance(current_state, torch.Tensor):
                 current_state = current_state.cpu().numpy()
 
-            if effective_rb:
+            if self.is_active:
                 #刚按下 RB 的瞬间，同步一次真机位置，防止跳变
                 if not self.prev_rb_state:
                     self.core.set_state_from_hardware(current_state)
@@ -247,11 +275,10 @@ class GamepadIKTeleop(Teleoperator):
                 # 新代码：发送全0的 delta，让 IK Core 保持输出上一次的稳定目标值
                 action_array = self.core.step(np.zeros(3), {})
             
-            self.prev_rb_state = effective_rb # 更新状态
+            self.prev_rb_state = self.is_active # 更新状态
         else:
             # --- 纯仿真模式 (Sim Only) ---
             # 这种模式下通常没有 observation，我们允许直接控制，不需要按 RB
-            # 或者如果你希望统一习惯，也可以加上 if effective_rb 的判断
             action_array = self.core.step(xyz_delta, manual)
 
         return torch.from_numpy(action_array).float()
