@@ -168,10 +168,10 @@ class MKRobot(Robot):
         images = {}
         for name, camera in self.cameras.items():
             # 优先尝试异步读取以提高帧率，如果不支持则使用普通读取
-            if hasattr(camera, "async_read"):
-                images[name] = camera.async_read()
-            else:
-                images[name] = camera.read()
+            # if hasattr(camera, "async_read"):
+            #     images[name] = camera.async_read()
+            # else:
+            images[name] = camera.read()
         return images
 
     # =========================================================

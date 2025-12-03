@@ -17,7 +17,8 @@
 
 import math
 import time
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
@@ -105,6 +106,21 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
 
     teleop_device: Teleoperator
 
+    #内部标志位，用于缓存是否需要传递 observation
+    _needs_observation: bool = field(default=False, init=False)
+
+    def __post_init__(self):
+        """
+        在初始化时只检查一次函数签名，避免在每帧的控制循环中产生开销。
+        """
+        try:
+            # 检查 get_action 是否需要 observation 参数（用于 IK 同步）
+            sig = inspect.signature(self.teleop_device.get_action)
+            self._needs_observation = "observation" in sig.parameters
+        except (ValueError, TypeError):
+            # 如果签名检查失败，则回退到默认行为（不传参）
+            self._needs_observation = False
+
     def complementary_data(self, complementary_data: dict) -> dict:
         """
         Retrieves the teleoperator's action and adds it to the complementary data.
@@ -117,7 +133,14 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
             `teleop_action` key.
         """
         new_complementary_data = dict(complementary_data)
-        new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
+        #使用缓存的标志位，而不是每帧都调用 inspect
+        if self._needs_observation:
+            # 从转换中获取 observation (需要之前的处理器已生成它)
+            observation = self.transition.get(TransitionKey.OBSERVATION, {})
+            new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action(observation)
+        else:
+            # 标准遥操作器，不需要 observation
+            new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
         return new_complementary_data
 
     def transform_features(

@@ -16,6 +16,7 @@
 
 import logging
 import time
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,6 +87,14 @@ try:
 except ImportError as e:
     print(f"⚠️ 注册 MKRobot/GamepadIK 失败 (如果不是用这两个硬件可忽略): {e}")
 
+#导入我们刚写的安全处理器
+# 注意：如果没有这个文件，请确保你已经完成了上一步新建 safety_processor.py 的操作
+try:
+    from lerobot.processor.safety_processor import MKArmSafetyProcessorStep
+except ImportError:
+    MKArmSafetyProcessorStep = None
+    print("⚠️ Warning: MKArmSafetyProcessorStep not found. Safety checks will be disabled.")
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -149,8 +158,7 @@ class RobotEnv(gym.Env):
         super().__init__()
 
         self.robot = robot
-        #self.display_cameras = display_cameras
-        self.display_cameras = False
+        self.display_cameras = display_cameras
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -211,15 +219,19 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
+        #  Action Space 改为直接对应关节数量.这里是根据mkrobot改掉了，可能不适应so101了
+        #action_dim = 3
+        action_dim = len(self._joint_names)
+
         bounds = {}
         bounds["min"] = -np.ones(action_dim)
         bounds["max"] = np.ones(action_dim)
 
-        if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
+        ## (删除原本关于 use_gripper 的 if/else 判断，因为 joint_names 里已经包含了 gripper)
+        # if self.use_gripper:
+        #     action_dim += 1
+        #     bounds["min"] = np.concatenate([bounds["min"], [0]])
+        #     bounds["max"] = np.concatenate([bounds["max"], [2]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -260,20 +272,18 @@ class RobotEnv(gym.Env):
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
     def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
-
-        self.robot.send_action(joint_targets_dict)
+        # [修正] 直接将 action 数组传给 Robot
+        # MKRobot 的 send_action 接收数组，并在内部处理 Sim->Real 转换和字典打包
+        # 之前的代码手动打包成了字典，导致 MKRobot 内部对字典切片报错
+        self.robot.send_action(action)
 
         obs = self._get_observation()
-
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
 
         if self.display_cameras:
             self.render()
 
         self.current_step += 1
-
         reward = 0.0
         terminated = False
         truncated = False
@@ -285,6 +295,32 @@ class RobotEnv(gym.Env):
             truncated,
             {TeleopEvents.IS_INTERVENTION: False},
         )
+    # def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+    #     """Execute one environment step with given action."""
+    #     joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+
+    #     self.robot.send_action(joint_targets_dict)
+
+    #     obs = self._get_observation()
+
+    #     self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
+
+    #     if self.display_cameras:
+    #         self.render()
+
+    #     self.current_step += 1
+
+    #     reward = 0.0
+    #     terminated = False
+    #     truncated = False
+
+    #     return (
+    #         obs,
+    #         reward,
+    #         terminated,
+    #         truncated,
+    #         {TeleopEvents.IS_INTERVENTION: False},
+    #     )
 
     def render(self) -> None:
         """Display robot camera feeds."""
@@ -469,6 +505,15 @@ def make_processors(
             )
         )
 
+    #动态解析 URDF 路径
+    # 我们直接从 teleop 配置中读取路径，因为那里是你定义的真实硬件路径
+    urdf_path = None
+    if cfg.teleop and hasattr(cfg.teleop, "urdf_path"):
+        raw_path = cfg.teleop.urdf_path
+        # 将相对路径转换为绝对路径，确保 pinocchio 能找到它
+        urdf_path = os.path.abspath(raw_path)
+        print(f"🛡️ Safety Processor will use URDF: {urdf_path}")
+
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
@@ -478,35 +523,47 @@ def make_processors(
         ),
     ]
 
-    # Replace InverseKinematicsProcessor with new kinematic processors
-    if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
-        # Add EE bounds and safety processor
-        inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-            ),
-            MapDeltaActionToRobotActionStep(),
-            EEReferenceAndDelta(
-                kinematics=kinematics_solver,
-                end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                motor_names=motor_names,
-                use_latched_reference=False,
-                use_ik_solution=True,
-            ),
-            EEBoundsAndSafety(
-                end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-            ),
-            GripperVelocityToJoint(
-                clip_max=cfg.processor.max_gripper_pos,
-                speed_factor=1.0,
-                discrete_gripper=True,
-            ),
-            InverseKinematicsRLStep(
-                kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
-            ),
-        ]
-        action_pipeline_steps.extend(inverse_kinematics_steps)
-        action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    # [新增] 如果路径存在且类已加载，则添加安全拦截器
+    if MKArmSafetyProcessorStep is not None and urdf_path is not None:
+        action_pipeline_steps.append(
+            MKArmSafetyProcessorStep(
+                urdf_path=urdf_path, 
+                min_z=0.220  # 你的安全高度限制
+            )
+        )
+    else:
+        print("⚠️ Skipping SafetyProcessor: URDF path missing or class not imported.")
+
+    #
+    # # Replace InverseKinematicsProcessor with new kinematic processors
+    # if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
+    #     # Add EE bounds and safety processor
+    #     inverse_kinematics_steps = [
+    #         MapTensorToDeltaActionDictStep(
+    #             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+    #         ),
+    #         MapDeltaActionToRobotActionStep(),
+    #         EEReferenceAndDelta(
+    #             kinematics=kinematics_solver,
+    #             end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+    #             motor_names=motor_names,
+    #             use_latched_reference=False,
+    #             use_ik_solution=True,
+    #         ),
+    #         EEBoundsAndSafety(
+    #             end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+    #         ),
+    #         GripperVelocityToJoint(
+    #             clip_max=cfg.processor.max_gripper_pos,
+    #             speed_factor=1.0,
+    #             discrete_gripper=True,
+    #         ),
+    #         InverseKinematicsRLStep(
+    #             kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+    #         ),
+    #     ]
+    #     action_pipeline_steps.extend(inverse_kinematics_steps)
+    #     action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
@@ -523,29 +580,37 @@ def step_env_and_process_transition(
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
 ) -> EnvTransition:
     """
-    Execute one step with processor pipeline.
-
-    Args:
-        env: The robot environment
-        transition: Current transition state
-        action: Action to execute
-        env_processor: Environment processor
-        action_processor: Action processor
-
-    Returns:
-        Processed transition with updated state.
+    使用处理器管道执行一步环境交互。
     """
 
     # Create action transition
     transition[TransitionKey.ACTION] = action
-    transition[TransitionKey.OBSERVATION] = (
-        env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
-    )
+    
+    # 修复 Observation 被覆盖导致丢失图像数据的问题
+    raw_joints = env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+    if TransitionKey.OBSERVATION not in transition or not isinstance(transition[TransitionKey.OBSERVATION], dict):
+        transition[TransitionKey.OBSERVATION] = {}
+    transition[TransitionKey.OBSERVATION].update(raw_joints)
+
     processed_action_transition = action_processor(transition)
+    # [关键] 这里拿到的是 Tensor，我们要保留它用于后续的 pipeline
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
-    obs, reward, terminated, truncated, info = env.step(processed_action)
+    # [修改] 创建一个独立的变量 robot_action 用于发送给机器人
+    # 不要直接修改 processed_action，因为它需要保持为 Tensor 传给 create_transition
+    robot_action = processed_action
+    
+    if isinstance(robot_action, torch.Tensor):
+        robot_action = robot_action.cpu().numpy()
+    
+    # 去除 Batch 维度 (例如从 [1, 7] 变为 [7])
+    if robot_action.ndim > 1:
+        robot_action = robot_action.squeeze(0)
 
+    # 环境执行一步 (传入 Numpy)
+    obs, reward, terminated, truncated, info = env.step(robot_action)
+
+    # 累加奖励和状态
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
@@ -553,18 +618,73 @@ def step_env_and_process_transition(
     new_info = processed_action_transition[TransitionKey.INFO].copy()
     new_info.update(info)
 
+    # 创建新的 transition (传入 Tensor)
     new_transition = create_transition(
         observation=obs,
-        action=processed_action,
+        action=processed_action, # [注意] 这里必须传 Tensor
         reward=reward,
         done=terminated,
         truncated=truncated,
         info=new_info,
         complementary_data=complementary_data,
     )
+    
+    # 处理新的环境状态 (Observation Processor)
+    # 这里的 env_processor 会处理 Tensor 类型的 action (例如添加 batch 维度)
     new_transition = env_processor(new_transition)
 
     return new_transition
+
+# def step_env_and_process_transition(
+#     env: gym.Env,
+#     transition: EnvTransition,
+#     action: torch.Tensor,
+#     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+#     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+# ) -> EnvTransition:
+#     """
+#     Execute one step with processor pipeline.
+
+#     Args:
+#         env: The robot environment
+#         transition: Current transition state
+#         action: Action to execute
+#         env_processor: Environment processor
+#         action_processor: Action processor
+
+#     Returns:
+#         Processed transition with updated state.
+#     """
+
+#     # Create action transition
+#     transition[TransitionKey.ACTION] = action
+#     transition[TransitionKey.OBSERVATION] = (
+#         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+#     )
+#     processed_action_transition = action_processor(transition)
+#     processed_action = processed_action_transition[TransitionKey.ACTION]
+
+#     obs, reward, terminated, truncated, info = env.step(processed_action)
+
+#     reward = reward + processed_action_transition[TransitionKey.REWARD]
+#     terminated = terminated or processed_action_transition[TransitionKey.DONE]
+#     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+#     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+#     new_info = processed_action_transition[TransitionKey.INFO].copy()
+#     new_info.update(info)
+
+#     new_transition = create_transition(
+#         observation=obs,
+#         action=processed_action,
+#         reward=reward,
+#         done=terminated,
+#         truncated=truncated,
+#         info=new_info,
+#         complementary_data=complementary_data,
+#     )
+#     new_transition = env_processor(new_transition)
+
+#     return new_transition
 
 
 # def control_loop(
@@ -814,13 +934,22 @@ def control_loop(
     episode_success_frames = 0  # [新增] 初始化成功帧计数器
     episode_start_time = time.perf_counter()
 
+    #初始化 Neutral Action 为当前机械臂的实际位置
+    current_joints = env.get_raw_joint_positions()
+    # 注意：确保 key 的顺序与 env._joint_names 一致
+    joint_names = list(env.robot.bus.motors.keys())
+    neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
+
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
         # Create a neutral action (no movement)
-        neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-        if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
+        #neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+        #if use_gripper:
+        #    neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
+        #确保 neutral_action 是 Tensor 格式传入
+        if not isinstance(neutral_action, torch.Tensor):
+             neutral_action = torch.from_numpy(neutral_action).float()
 
         # Use the new step function
         transition = step_env_and_process_transition(
@@ -830,6 +959,15 @@ def control_loop(
             env_processor=env_processor,
             action_processor=action_processor,
         )
+
+        #更新 neutral_action 为当前帧实际执行的动作
+        # 这样如果没有人工介入，下一帧就会继续维持这个姿态
+        executed_action = transition[TransitionKey.ACTION]
+        if isinstance(executed_action, np.ndarray):
+            neutral_action = torch.from_numpy(executed_action).float()
+        else:
+            neutral_action = executed_action.clone()
+
         #实时打印图像统计信息 
         # 从 transition 中获取处理过的观测数据 (这是喂给 Reward Model 的数据)
         proc_obs = transition[TransitionKey.OBSERVATION]
@@ -844,7 +982,10 @@ def control_loop(
                 stats_msg.append(f"{key}: {v_shape} [{v_min:.2f}, {v_max:.2f}]")
         
         # 打印在同一行 (加上之前的 episode 信息)
-        print(f"Epi: {episode_idx} | Reward: {transition[TransitionKey.REWARD].item():.4f} | {' | '.join(stats_msg)}", end="\r")
+        #print(f"Epi: {episode_idx} | Reward: {transition[TransitionKey.REWARD].item():.4f} | {' | '.join(stats_msg)}", end="\r")
+        reward_val = transition[TransitionKey.REWARD]
+        reward_val = reward_val.item() if hasattr(reward_val, "item") else reward_val
+        print(f"Epi: {episode_idx} | Reward: {reward_val:.4f} | {' | '.join(stats_msg)}", end="\r")
 
         terminated = transition.get(TransitionKey.DONE, False)
         truncated = transition.get(TransitionKey.TRUNCATED, False)
@@ -884,6 +1025,7 @@ def control_loop(
         episode_step += 1
 
         # Handle episode termination
+        #在 Episode 结束重置环境时，也要重置 neutral_action
         if terminated or truncated:
             episode_time = time.perf_counter() - episode_start_time
             # [修改] 日志增加显示成功帧数
@@ -913,6 +1055,10 @@ def control_loop(
             obs, info = env.reset()
             env_processor.reset()
             action_processor.reset()
+
+            # 重新获取重置后的位置作为新的 Hold 点
+            current_joints = env.get_raw_joint_positions()
+            neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
 
             transition = create_transition(observation=obs, info=info)
             transition = env_processor(transition)

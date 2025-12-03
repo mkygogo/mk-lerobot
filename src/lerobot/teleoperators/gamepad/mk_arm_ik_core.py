@@ -242,15 +242,40 @@ class SixDofArm:
                 os.remove(tmp_urdf_path)
         return model, collision_model, visual_model
 
+    # def set_state_from_hardware(self, q_real):
+    #     """ SYNC 模式：q_real 已经是 SixDofRealArm 转换过的 Sim 坐标系数据 """
+    #     n = min(len(self.q), len(q_real))
+    #     self.q[:n] = q_real[:n]
+        
+    #     #夹爪单位换算 (归一化 0~1 -> 物理单位 0~0.04)
+    #     # 如果不乘这个系数，仿真器会认为夹爪在“几米”远的地方，导致归位时动作长时间卡在最大值。
+    #     if n > 6:
+    #         # 假设 q[6] 是夹爪，且最大物理行程是 0.04 (与 step() 中的 clip 对应)
+    #         self.q[6] = q_real[6] * 0.04
+
+    #     pin.framesForwardKinematics(self.model, self.data, self.q)
+    #     self.target_pos = self.data.oMf[self.ik_frame_id].translation.copy()
+    #     self.valid_target_pos = self.target_pos.copy()
+        
+    #     self.ik_solver.q_ref_3dof = self.q[:3].copy()
+        
+    #     # [🚨 严重错误修复] 原来是 False，导致瞬间触发限位跳变
+    #     # 改为 True，表示"当前状态是受信任的初始状态，暂时忽略限位检查"
+    #     # 只有当用户推摇杆(has_input)时，update() 才会自动将其设为 False 并开始限位
+    #     self.in_zero_mode = True
     def set_state_from_hardware(self, q_real):
         """ SYNC 模式：q_real 已经是 SixDofRealArm 转换过的 Sim 坐标系数据 """
+        # [新增] 强制压平输入，防止 (1, 14) 这种 Shape 导致广播错误
+        if hasattr(q_real, "flatten"):
+            q_real = q_real.flatten()
+        elif isinstance(q_real, (list, tuple)):
+            q_real = np.array(q_real).flatten()
+
         n = min(len(self.q), len(q_real))
         self.q[:n] = q_real[:n]
         
-        #夹爪单位换算 (归一化 0~1 -> 物理单位 0~0.04)
-        # 如果不乘这个系数，仿真器会认为夹爪在“几米”远的地方，导致归位时动作长时间卡在最大值。
+        # 夹爪单位换算 (归一化 0~1 -> 物理单位 0~0.04)
         if n > 6:
-            # 假设 q[6] 是夹爪，且最大物理行程是 0.04 (与 step() 中的 clip 对应)
             self.q[6] = q_real[6] * 0.04
 
         pin.framesForwardKinematics(self.model, self.data, self.q)
@@ -259,10 +284,9 @@ class SixDofArm:
         
         self.ik_solver.q_ref_3dof = self.q[:3].copy()
         
-        # [🚨 严重错误修复] 原来是 False，导致瞬间触发限位跳变
-        # 改为 True，表示"当前状态是受信任的初始状态，暂时忽略限位检查"
-        # 只有当用户推摇杆(has_input)时，update() 才会自动将其设为 False 并开始限位
+        # 设为 True，表示"当前状态是受信任的初始状态"
         self.in_zero_mode = True
+
 
     def update(self, xyz_delta, manual_controls, dt=0.1):
         """ 完全保留你的 update 逻辑 (包含 Safety Clamping, Smoothing, IK) """

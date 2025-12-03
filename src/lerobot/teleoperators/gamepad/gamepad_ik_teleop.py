@@ -187,41 +187,146 @@ class GamepadIKTeleop(Teleoperator):
             TeleopEvents.IS_INTERVENTION: self.is_active
         }
 
+    # def get_action(self, observation: dict) -> torch.Tensor:
+    #     pygame.event.pump()
+        
+    #     #启动时的首帧强制同步 (接口层安全保障)
+    #     # 这确保了无论什么脚本调用，第一帧永远是“吸附”在真机当前位置的，绝对不会跳变
+    #     if "observation.state" in observation:
+    #         current_state = observation["observation.state"]
+    #         if isinstance(current_state, torch.Tensor):
+    #             current_state = current_state.cpu().numpy()
+
+    #         if not self.has_synced_startup:
+    #             self.core.set_state_from_hardware(current_state)
+    #             self.has_synced_startup = True
+    #             logger.info("🛡️ Safety: Teleop first-frame synced with hardware.")
+    #             # 直接返回当前状态，跳过后续所有计算，确保绝对静止
+    #             return torch.from_numpy(current_state).float()
+
+    #     # ========================================================
+    #     # 1. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
+    #     # ========================================================
+    #     # 获取物理按键状态
+    #     phys_rb_pressed = (self.joystick.get_button(self.BTN_RB) == 1)
+        
+    #     # 处理安全锁：如果锁着，必须先松手才能解锁
+    #     if self.rb_safety_lock:
+    #         if not phys_rb_pressed:
+    #             self.rb_safety_lock = False # 解锁
+    #             logger.info("🔓 Safety Lock Disengaged (RB Released)")
+    #         # 锁定期强制视为没按
+    #         self.is_active = False
+    #     else:
+    #         self.is_active = phys_rb_pressed
+
+    #     # ========================================================
+    #     # 2. X键 长按归位检测 (最高优先级)
+    #     # ========================================================
+    #     if self.joystick.get_button(self.BTN_X):
+    #         if self.x_press_start_time is None:
+    #             self.x_press_start_time = time.time()
+    #         elif time.time() - self.x_press_start_time > 2.0: 
+    #             self.core.start_homing()
+    #     else:
+    #         self.x_press_start_time = None
+
+    #     # ========================================================
+    #     # 3. 归位模式执行 (Homing Mode)
+    #     # ========================================================
+    #     if self.core.is_homing:
+    #         action_array = self.core.step_homing()
+            
+    #         # [关键] 检测归位是否刚刚结束
+    #         # 如果这一步跑完，Core 里的标志位变 False 了，说明刚结束 -> 上锁
+    #         if not self.core.is_homing:
+    #             self.rb_safety_lock = True
+    #             logger.info("🔒 Safety Lock Engaged (Homing Complete)")
+                
+    #         return torch.from_numpy(action_array).float()
+
+    #     # ========================================================
+    #     # 4. 常规控制模式 (HIL-SERL)
+    #     # ========================================================
+        
+    #     # 获取手柄输入
+    #     xyz_delta, manual = self._get_inputs()
+        
+    #     # [逻辑修改] 真机模式下，必须按住 RB 才算介入 (Active)，否则为同步 (Passive)
+    #     # 纯仿真模式下 (没有 observation)，总是视为 Active
+        
+    #     if "observation.state" in observation:
+    #         # --- 真机 / Gym 环境 ---
+    #         current_state = observation["observation.state"]
+    #         if isinstance(current_state, torch.Tensor):
+    #             current_state = current_state.cpu().numpy()
+
+    #         if self.is_active:
+    #             #刚按下 RB 的瞬间，同步一次真机位置，防止跳变
+    #             if not self.prev_rb_state:
+    #                 self.core.set_state_from_hardware(current_state)
+    #                 logger.info("🎮 Active Control Engaged: Synced with Hardware")
+    #             # [主动控制] 按住了 RB -> 允许 IK 计算和移动
+    #             # 即使摇杆不动，这里也应该调用 step，保持 IK 目标点稳定（Hold）
+    #             action_array = self.core.step(xyz_delta, manual)
+    #         else:
+    #             # 没按 RB
+    #             # 旧代码：self.core.set_state_from_hardware(current_state) -> 导致震荡发热
+    #             # 新代码：发送全0的 delta，让 IK Core 保持输出上一次的稳定目标值
+    #             action_array = self.core.step(np.zeros(3), {})
+            
+    #         self.prev_rb_state = self.is_active # 更新状态
+    #     else:
+    #         # --- 纯仿真模式 (Sim Only) ---
+    #         # 这种模式下通常没有 observation，我们允许直接控制，不需要按 RB
+    #         action_array = self.core.step(xyz_delta, manual)
+
+    #     return torch.from_numpy(action_array).float()
+
     def get_action(self, observation: dict) -> torch.Tensor:
         pygame.event.pump()
         
-        #启动时的首帧强制同步 (接口层安全保障)
-        # 这确保了无论什么脚本调用，第一帧永远是“吸附”在真机当前位置的，绝对不会跳变
+        # --- 1. 处理观测数据 (处理 Batch 和 Tensor) ---
+        current_state = None
         if "observation.state" in observation:
-            current_state = observation["observation.state"]
-            if isinstance(current_state, torch.Tensor):
-                current_state = current_state.cpu().numpy()
+            raw_state = observation["observation.state"]
+            
+            # 统一转为 Numpy
+            if isinstance(raw_state, torch.Tensor):
+                raw_state = raw_state.cpu().numpy()
+            elif not isinstance(raw_state, np.ndarray):
+                raw_state = np.array(raw_state)
 
+            # [核心修复] 强制压平数组 (flatten)，彻底解决 (1,14) vs (14,) 的问题
+            current_state = raw_state.flatten()
+
+        # --- 2. 启动同步 (Startup Sync) ---
+        if current_state is not None:
             if not self.has_synced_startup:
                 self.core.set_state_from_hardware(current_state)
                 self.has_synced_startup = True
                 logger.info("🛡️ Safety: Teleop first-frame synced with hardware.")
-                # 直接返回当前状态，跳过后续所有计算，确保绝对静止
-                return torch.from_numpy(current_state).float()
+                
+                # 返回对应长度的动作 (防止越界)
+                n_joints = 7 # 假设7轴
+                action_out = current_state[:n_joints] if len(current_state) >= n_joints else current_state
+                return torch.from_numpy(action_out).float()
 
         # ========================================================
-        # 1. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
+        # 3. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
         # ========================================================
-        # 获取物理按键状态
         phys_rb_pressed = (self.joystick.get_button(self.BTN_RB) == 1)
         
-        # 处理安全锁：如果锁着，必须先松手才能解锁
         if self.rb_safety_lock:
             if not phys_rb_pressed:
-                self.rb_safety_lock = False # 解锁
+                self.rb_safety_lock = False
                 logger.info("🔓 Safety Lock Disengaged (RB Released)")
-            # 锁定期强制视为没按
             self.is_active = False
         else:
             self.is_active = phys_rb_pressed
 
         # ========================================================
-        # 2. X键 长按归位检测 (最高优先级)
+        # 4. X键 长按归位检测
         # ========================================================
         if self.joystick.get_button(self.BTN_X):
             if self.x_press_start_time is None:
@@ -232,53 +337,34 @@ class GamepadIKTeleop(Teleoperator):
             self.x_press_start_time = None
 
         # ========================================================
-        # 3. 归位模式执行 (Homing Mode)
+        # 5. 归位模式执行
         # ========================================================
         if self.core.is_homing:
             action_array = self.core.step_homing()
-            
-            # [关键] 检测归位是否刚刚结束
-            # 如果这一步跑完，Core 里的标志位变 False 了，说明刚结束 -> 上锁
             if not self.core.is_homing:
                 self.rb_safety_lock = True
                 logger.info("🔒 Safety Lock Engaged (Homing Complete)")
-                
             return torch.from_numpy(action_array).float()
 
         # ========================================================
-        # 4. 常规控制模式 (HIL-SERL)
+        # 6. 常规控制模式 (HIL-SERL)
         # ========================================================
-        
-        # 获取手柄输入
         xyz_delta, manual = self._get_inputs()
         
-        # [逻辑修改] 真机模式下，必须按住 RB 才算介入 (Active)，否则为同步 (Passive)
-        # 纯仿真模式下 (没有 observation)，总是视为 Active
-        
-        if "observation.state" in observation:
-            # --- 真机 / Gym 环境 ---
-            current_state = observation["observation.state"]
-            if isinstance(current_state, torch.Tensor):
-                current_state = current_state.cpu().numpy()
-
+        if current_state is not None:
+            # --- 真机模式 ---
             if self.is_active:
-                #刚按下 RB 的瞬间，同步一次真机位置，防止跳变
                 if not self.prev_rb_state:
                     self.core.set_state_from_hardware(current_state)
                     logger.info("🎮 Active Control Engaged: Synced with Hardware")
-                # [主动控制] 按住了 RB -> 允许 IK 计算和移动
-                # 即使摇杆不动，这里也应该调用 step，保持 IK 目标点稳定（Hold）
                 action_array = self.core.step(xyz_delta, manual)
             else:
-                # 没按 RB
-                # 旧代码：self.core.set_state_from_hardware(current_state) -> 导致震荡发热
-                # 新代码：发送全0的 delta，让 IK Core 保持输出上一次的稳定目标值
+                # 没按 RB -> 保持 IK 目标不变，不吸附真机
                 action_array = self.core.step(np.zeros(3), {})
             
-            self.prev_rb_state = self.is_active # 更新状态
+            self.prev_rb_state = self.is_active
         else:
-            # --- 纯仿真模式 (Sim Only) ---
-            # 这种模式下通常没有 observation，我们允许直接控制，不需要按 RB
+            # --- 纯仿真模式 ---
             action_array = self.core.step(xyz_delta, manual)
 
         return torch.from_numpy(action_array).float()
