@@ -411,6 +411,100 @@ class ReplayBuffer:
             yield queue.popleft()
             enqueue(1)
 
+    # @classmethod
+    # def from_lerobot_dataset(
+    #     cls,
+    #     lerobot_dataset: LeRobotDataset,
+    #     device: str = "cuda:0",
+    #     state_keys: Sequence[str] | None = None,
+    #     capacity: int | None = None,
+    #     image_augmentation_function: Callable | None = None,
+    #     use_drq: bool = True,
+    #     storage_device: str = "cpu",
+    #     optimize_memory: bool = False,
+    # ) -> "ReplayBuffer":
+    #     """
+    #     Convert a LeRobotDataset into a ReplayBuffer.
+
+    #     Args:
+    #         lerobot_dataset (LeRobotDataset): The dataset to convert.
+    #         device (str): The device for sampling tensors. Defaults to "cuda:0".
+    #         state_keys (Sequence[str] | None): The list of keys that appear in `state` and `next_state`.
+    #         capacity (int | None): Buffer capacity. If None, uses dataset length.
+    #         action_mask (Sequence[int] | None): Indices of action dimensions to keep.
+    #         image_augmentation_function (Callable | None): Function for image augmentation.
+    #             If None, uses default random shift with pad=4.
+    #         use_drq (bool): Whether to use DrQ image augmentation when sampling.
+    #         storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
+    #         optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+
+    #     Returns:
+    #         ReplayBuffer: The replay buffer with dataset transitions.
+    #     """
+    #     if capacity is None:
+    #         capacity = len(lerobot_dataset)
+
+    #     if capacity < len(lerobot_dataset):
+    #         raise ValueError(
+    #             "The capacity of the ReplayBuffer must be greater than or equal to the length of the LeRobotDataset."
+    #         )
+
+    #     # Create replay buffer with image augmentation and DrQ settings
+    #     replay_buffer = cls(
+    #         capacity=capacity,
+    #         device=device,
+    #         state_keys=state_keys,
+    #         image_augmentation_function=image_augmentation_function,
+    #         use_drq=use_drq,
+    #         storage_device=storage_device,
+    #         optimize_memory=optimize_memory,
+    #     )
+
+    #     # Convert dataset to transitions
+    #     list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+
+    #     # Initialize the buffer with the first transition to set up storage tensors
+    #     if list_transition:
+    #         first_transition = list_transition[0]
+    #         first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
+    #         first_action = first_transition[ACTION].to(device)
+
+    #         # Get complementary info if available
+    #         first_complementary_info = None
+    #         if (
+    #             "complementary_info" in first_transition
+    #             and first_transition["complementary_info"] is not None
+    #         ):
+    #             first_complementary_info = {
+    #                 k: v.to(device) for k, v in first_transition["complementary_info"].items()
+    #             }
+
+    #         replay_buffer._initialize_storage(
+    #             state=first_state, action=first_action, complementary_info=first_complementary_info
+    #         )
+
+    #     # Fill the buffer with all transitions
+    #     for data in list_transition:
+    #         for k, v in data.items():
+    #             if isinstance(v, dict):
+    #                 for key, tensor in v.items():
+    #                     v[key] = tensor.to(storage_device)
+    #             elif isinstance(v, torch.Tensor):
+    #                 data[k] = v.to(storage_device)
+
+    #         action = data[ACTION]
+
+    #         replay_buffer.add(
+    #             state=data["state"],
+    #             action=action,
+    #             reward=data["reward"],
+    #             next_state=data["next_state"],
+    #             done=data["done"],
+    #             truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
+    #             complementary_info=data.get("complementary_info", None),
+    #         )
+
+    #     return replay_buffer
     @classmethod
     def from_lerobot_dataset(
         cls,
@@ -424,32 +518,19 @@ class ReplayBuffer:
         optimize_memory: bool = False,
     ) -> "ReplayBuffer":
         """
-        Convert a LeRobotDataset into a ReplayBuffer.
-
-        Args:
-            lerobot_dataset (LeRobotDataset): The dataset to convert.
-            device (str): The device for sampling tensors. Defaults to "cuda:0".
-            state_keys (Sequence[str] | None): The list of keys that appear in `state` and `next_state`.
-            capacity (int | None): Buffer capacity. If None, uses dataset length.
-            action_mask (Sequence[int] | None): Indices of action dimensions to keep.
-            image_augmentation_function (Callable | None): Function for image augmentation.
-                If None, uses default random shift with pad=4.
-            use_drq (bool): Whether to use DrQ image augmentation when sampling.
-            storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
-            optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
-
-        Returns:
-            ReplayBuffer: The replay buffer with dataset transitions.
+        Memory-Optimized version: Loads dataset directly into buffer without intermediate list.
         """
+        import logging
+        
         if capacity is None:
             capacity = len(lerobot_dataset)
 
         if capacity < len(lerobot_dataset):
             raise ValueError(
-                "The capacity of the ReplayBuffer must be greater than or equal to the length of the LeRobotDataset."
+                "Capacity must be >= dataset length."
             )
 
-        # Create replay buffer with image augmentation and DrQ settings
+        # Initialize Buffer
         replay_buffer = cls(
             capacity=capacity,
             device=device,
@@ -460,48 +541,76 @@ class ReplayBuffer:
             optimize_memory=optimize_memory,
         )
 
-        # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+        num_frames = len(lerobot_dataset)
+        if num_frames == 0:
+            return replay_buffer
 
-        # Initialize the buffer with the first transition to set up storage tensors
-        if list_transition:
-            first_transition = list_transition[0]
-            first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
-            first_action = first_transition[ACTION].to(device)
+        logging.info("🚀 Loading dataset into ReplayBuffer (Streaming Mode)...")
+        
+        # Check metadata from first sample
+        sample0 = lerobot_dataset[0]
+        has_done_key = DONE in sample0
+        
+        # --- 修正点：属性名从 .dataset 改为 .hf_dataset ---
+        hf_dataset = lerobot_dataset.hf_dataset 
 
-            # Get complementary info if available
-            first_complementary_info = None
-            if (
-                "complementary_info" in first_transition
-                and first_transition["complementary_info"] is not None
-            ):
-                first_complementary_info = {
-                    k: v.to(device) for k, v in first_transition["complementary_info"].items()
-                }
+        for i in tqdm(range(num_frames), desc="Populating Buffer"):
+            # Load current frame
+            item = lerobot_dataset[i]
+            
+            # Prepare State/Action/Reward
+            state = {k: item[k].unsqueeze(0) for k in state_keys}
+            action = item[ACTION].unsqueeze(0)
+            reward = float(item[REWARD].item())
+            
+            # Prepare Done
+            if has_done_key:
+                done = bool(item[DONE].item())
+            else:
+                # Fast episode boundary check using HF dataset directly
+                done = False
+                if i == num_frames - 1:
+                    done = True
+                else:
+                    if hf_dataset[i]["episode_index"] != hf_dataset[i+1]["episode_index"]:
+                        done = True
+            
+            truncated = done
+            
+            # Prepare Next State (Optimized)
+            if optimize_memory:
+                # 关键优化：如果开启了内存优化，buffer.add 会忽略 next_state 参数
+                # 所以我们直接传入 state 占位，避免去读取解码 dataset[i+1] 的图像
+                next_state = state 
+            else:
+                # Standard loading
+                if done:
+                    next_state = state
+                else:
+                    next_item = lerobot_dataset[i+1]
+                    next_state = {k: next_item[k].unsqueeze(0) for k in state_keys}
 
-            replay_buffer._initialize_storage(
-                state=first_state, action=first_action, complementary_info=first_complementary_info
-            )
+            # Prepare Complementary Info
+            complementary_info = None
+            comp_keys = [k for k in item.keys() if k.startswith("complementary_info.")]
+            if comp_keys:
+                complementary_info = {}
+                for k in comp_keys:
+                    clean_key = k[len("complementary_info."):]
+                    val = item[k]
+                    if isinstance(val, torch.Tensor):
+                        val = val.unsqueeze(0)
+                    complementary_info[clean_key] = val
 
-        # Fill the buffer with all transitions
-        for data in list_transition:
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    for key, tensor in v.items():
-                        v[key] = tensor.to(storage_device)
-                elif isinstance(v, torch.Tensor):
-                    data[k] = v.to(storage_device)
-
-            action = data[ACTION]
-
+            # Add directly to buffer (No intermediate list!)
             replay_buffer.add(
-                state=data["state"],
+                state=state,
                 action=action,
-                reward=data["reward"],
-                next_state=data["next_state"],
-                done=data["done"],
-                truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
-                complementary_info=data.get("complementary_info", None),
+                reward=reward,
+                next_state=next_state,
+                done=done,
+                truncated=truncated,
+                complementary_info=complementary_info,
             )
 
         return replay_buffer
