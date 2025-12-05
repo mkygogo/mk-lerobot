@@ -97,6 +97,18 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 
+# --- 🛡️ 配置区域：Policy 安全屋 (训练活动范围) ---
+# 这里的范围应该比 mk_robot.py 里的物理硬限位要小 (建议 80%~90%)
+# 确保 Policy 不会把机械臂扭成 IK 算不出来的麻花姿态，方便人工随时接管
+POLICY_SAFE_LIMITS = {
+    # 关节索引: (最小弧度, 最大弧度)
+    0: (-1.0, 1.0), # Base
+    1: (0.74, 1.70), # Shoulder (限制不要倒地)
+    2: (-0.42, -1.0), # Elbow
+    3: (-1.7, 1.2), # Wrist 1
+    4: (-0.4, 0.4), # Wrist 2
+    5: (-2.0, 2.0), # Wrist 3
+}
 
 @dataclass
 class DatasetConfig:
@@ -179,6 +191,16 @@ class RobotEnv(gym.Env):
         self._joint_names = list(self.robot.bus.motors.keys())
         self._raw_joint_positions = None
 
+        #用于存储上一步的平滑动作，实现滤波
+        self.last_policy_action = None
+
+        #状态机变量
+        # 模式: "IDLE" (发呆/保持), "EXPLORE" (RL探索), "ZEROING" (自动归零)
+        self.rl_mode = "IDLE" 
+        self.btn_counter_y = 0  # Y键长按计时
+        self.btn_counter_x = 0  # X键长按计时
+        self.last_policy_action = None # 用于平滑滤波
+
         self._setup_spaces()
 
     def _get_observation(self) -> dict[str, Any]:
@@ -252,8 +274,10 @@ class RobotEnv(gym.Env):
         Returns:
             Tuple of (observation, info) dictionaries.
         """
-        # Reset the robot
-        # self.robot.reset()
+        #Reset 时不要重置 rl_mode，保持用户的控制状态
+        # 比如用户正在 EXPLORE，回合结束 reset 后应该继续 EXPLORE，不需要重新按 Y
+        # 除非处于归零状态，归零完成后会自动切回 IDLE
+        
         start_time = time.perf_counter()
         if self.reset_pose is not None:
             log_say("Reset the environment.", play_sounds=True)
@@ -261,12 +285,15 @@ class RobotEnv(gym.Env):
             log_say("Reset the environment done.", play_sounds=True)
 
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
-
         super().reset(seed=seed, options=options)
-
-        # Reset episode tracking variables.
         self.current_step = 0
         self.episode_data = None
+        
+        self.last_policy_action = None
+        # 计时器清零
+        self.btn_counter_y = 0
+        self.btn_counter_x = 0
+        
         obs = self._get_observation()
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
         return obs, {TeleopEvents.IS_INTERVENTION: False}
@@ -582,35 +609,172 @@ def step_env_and_process_transition(
     """
     使用处理器管道执行一步环境交互。
     """
-
     # Create action transition
     transition[TransitionKey.ACTION] = action
     
-    # 修复 Observation 被覆盖导致丢失图像数据的问题
     raw_joints = env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     if TransitionKey.OBSERVATION not in transition or not isinstance(transition[TransitionKey.OBSERVATION], dict):
         transition[TransitionKey.OBSERVATION] = {}
     transition[TransitionKey.OBSERVATION].update(raw_joints)
 
     processed_action_transition = action_processor(transition)
-    # [关键] 这里拿到的是 Tensor，我们要保留它用于后续的 pipeline
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
-    # [修改] 创建一个独立的变量 robot_action 用于发送给机器人
-    # 不要直接修改 processed_action，因为它需要保持为 Tensor 传给 create_transition
-    robot_action = processed_action
+    # 克隆 Policy 的原始动作
+    robot_action = processed_action.clone()
     
+    # 获取当前真实位置
+    joint_names = list(env.robot.bus.motors.keys()) 
+    current_pos_list = [raw_joints[f"{name}.pos"] for name in joint_names]
+    current_pos_tensor = torch.tensor(current_pos_list, device=robot_action.device, dtype=robot_action.dtype)
+    
+    # -------------------------------------------------------------------------
+    # 🎮 状态机控制逻辑 (State Machine Control)
+    # -------------------------------------------------------------------------
+    
+    # 1. 获取按键信号
+    is_intervention = False
+    if TransitionKey.INFO in processed_action_transition:
+        info = processed_action_transition[TransitionKey.INFO]
+        # Y键 (Success) -> Start / Resume
+        is_y_pressed = info.get(TeleopEvents.SUCCESS, False)
+        # X键 (Rerecord) -> Stop & Zero
+        is_x_pressed = info.get(TeleopEvents.RERECORD_EPISODE, False)
+        # RB键 (Intervention) -> Manual Takeover
+        is_rb_pressed = info.get(TeleopEvents.IS_INTERVENTION, False)
+        
+        # 任何按键按下都视为介入，暂停 Policy 逻辑
+        is_intervention = is_y_pressed or is_x_pressed or is_rb_pressed
+
+    # 2. 更新按键计时器 & 状态切换
+    # 长按阈值: 30帧 (约1秒)
+    LONG_PRESS_THRES = 30 
+    
+    if is_y_pressed:
+        env.btn_counter_y += 1
+    else:
+        env.btn_counter_y = 0
+        
+    if is_x_pressed:
+        env.btn_counter_x += 1
+    else:
+        env.btn_counter_x = 0
+        
+    # [状态切换: IDLE -> EXPLORE] 长按 Y
+    if env.btn_counter_y > LONG_PRESS_THRES:
+        if env.rl_mode != "EXPLORE":
+            env.rl_mode = "EXPLORE"
+            print("\n🚀 [System] ACTIVATED: Policy Exploration Started! (Y pressed)")
+        env.btn_counter_y = 0 # 重置防止重复触发
+
+    # [状态切换: ANY -> ZEROING] 长按 X
+    if env.btn_counter_x > LONG_PRESS_THRES:
+        if env.rl_mode != "ZEROING":
+            env.rl_mode = "ZEROING"
+            print("\n🛑 [System] STOPPED: Returning to ZERO... (X pressed)")
+        env.btn_counter_x = 0
+
+    # 3. 根据当前模式决定 robot_action
+    
+    # [模式 A: ZEROING] 自动归零
+    if env.rl_mode == "ZEROING":
+        # 简单的 P 控制归零，速度限制在 0.05
+        ZERO_SPEED = 0.05
+        target = torch.zeros_like(current_pos_tensor)
+        # 仅归零手臂(前6轴)，夹爪保持
+        if robot_action.ndim == 2: # [1, 7]
+            target = target.unsqueeze(0)
+            target[:, 6] = current_pos_tensor[6] 
+            delta = target[:, :6] - current_pos_tensor[:6]
+            delta = torch.clamp(delta, -ZERO_SPEED, ZERO_SPEED)
+            robot_action[:, :6] = current_pos_tensor[:6] + delta
+            
+            # 检查是否已归零
+            if torch.abs(current_pos_tensor[:6]).max() < 0.05:
+                env.rl_mode = "IDLE"
+                print("✅ [System] Zeroed. Entering IDLE mode. Press Y to Start.")
+        else: # [7]
+            target[6] = current_pos_tensor[6]
+            delta = target[:6] - current_pos_tensor[:6]
+            delta = torch.clamp(delta, -ZERO_SPEED, ZERO_SPEED)
+            robot_action[:6] = current_pos_tensor[:6] + delta
+            
+            if torch.abs(current_pos_tensor[:6]).max() < 0.05:
+                env.rl_mode = "IDLE"
+                print("✅ [System] Zeroed. Entering IDLE mode. Press Y to Start.")
+
+    # [模式 B: IDLE] 保持不动
+    elif env.rl_mode == "IDLE":
+        # 强制动作等于当前位置 = 锁死不动
+        if robot_action.ndim == 2:
+            robot_action = current_pos_tensor.unsqueeze(0)
+        else:
+            robot_action = current_pos_tensor
+            
+        # 在 IDLE 模式下，允许 RB 键手动介入微调，但不允许 Policy 动
+        # 如果 is_rb_pressed 为真，action_processor 已经把手柄的动作覆盖在 processed_action 里了
+        # 但我们需要确保如果没按 RB，就是完全不动。
+        if is_rb_pressed:
+            # 恢复手柄动作 (但注意手柄动作可能被上面的逻辑覆盖了，这里重新赋值)
+            robot_action = processed_action.clone()
+
+    # [模式 C: EXPLORE] Policy 控制 (带安全限制)
+    elif env.rl_mode == "EXPLORE":
+        # 如果按住了 RB 进行人工接管，则直接穿透，不做处理
+        if is_intervention:
+            env.last_policy_action = None
+        else:
+            # 这里放入之前的【双模限速 + EMA滤波 + 安全屋】代码
+            POLICY_MAX_STEP = 0.04
+            EMA_ALPHA = 0.2
+            
+            # [A] 提取目标
+            arm_target = None
+            arm_current = None
+            if robot_action.ndim == 2: 
+                arm_target = robot_action[:, :6] 
+                arm_current = current_pos_tensor[:6].unsqueeze(0)
+            elif robot_action.ndim == 1:
+                arm_target = robot_action[:6]
+                arm_current = current_pos_tensor[:6]
+                
+            if arm_target is not None:
+                # [B] EMA 滤波
+                last_action = env.last_policy_action
+                if last_action is None: last_action = arm_current.clone()
+                if last_action.ndim != arm_target.ndim:
+                    if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
+                
+                arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
+                env.last_policy_action = arm_target_smoothed.detach()
+
+                # [C] Policy 安全屋
+                for i in range(6):
+                    min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
+                    if robot_action.ndim == 2:
+                        arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
+                    else:
+                        arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
+
+                # [D] 限速
+                delta = arm_target_smoothed - arm_current
+                delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
+                
+                if robot_action.ndim == 2:
+                    robot_action[:, :6] = arm_current + delta_clipped
+                else:
+                    robot_action[:6] = arm_current + delta_clipped
+
+    # -------------------------------------------------------------------------
+
     if isinstance(robot_action, torch.Tensor):
         robot_action = robot_action.cpu().numpy()
     
-    # 去除 Batch 维度 (例如从 [1, 7] 变为 [7])
     if robot_action.ndim > 1:
         robot_action = robot_action.squeeze(0)
 
-    # 环境执行一步 (传入 Numpy)
     obs, reward, terminated, truncated, info = env.step(robot_action)
 
-    # 累加奖励和状态
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
@@ -618,19 +782,15 @@ def step_env_and_process_transition(
     new_info = processed_action_transition[TransitionKey.INFO].copy()
     new_info.update(info)
 
-    # 创建新的 transition (传入 Tensor)
     new_transition = create_transition(
         observation=obs,
-        action=processed_action, # [注意] 这里必须传 Tensor
+        action=processed_action, # 存入 Buffer 的是原始动作
         reward=reward,
         done=terminated,
         truncated=truncated,
         info=new_info,
         complementary_data=complementary_data,
     )
-    
-    # 处理新的环境状态 (Observation Processor)
-    # 这里的 env_processor 会处理 Tensor 类型的 action (例如添加 batch 维度)
     new_transition = env_processor(new_transition)
 
     return new_transition
@@ -643,28 +803,117 @@ def step_env_and_process_transition(
 #     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
 # ) -> EnvTransition:
 #     """
-#     Execute one step with processor pipeline.
-
-#     Args:
-#         env: The robot environment
-#         transition: Current transition state
-#         action: Action to execute
-#         env_processor: Environment processor
-#         action_processor: Action processor
-
-#     Returns:
-#         Processed transition with updated state.
+#     使用处理器管道执行一步环境交互。
 #     """
-
 #     # Create action transition
 #     transition[TransitionKey.ACTION] = action
-#     transition[TransitionKey.OBSERVATION] = (
-#         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
-#     )
+    
+#     raw_joints = env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+#     if TransitionKey.OBSERVATION not in transition or not isinstance(transition[TransitionKey.OBSERVATION], dict):
+#         transition[TransitionKey.OBSERVATION] = {}
+#     transition[TransitionKey.OBSERVATION].update(raw_joints)
+
 #     processed_action_transition = action_processor(transition)
 #     processed_action = processed_action_transition[TransitionKey.ACTION]
 
-#     obs, reward, terminated, truncated, info = env.step(processed_action)
+#     # 使用 clone() 创建副本，避免直接修改 Buffer 中存储的原始 Policy 动作
+#     robot_action = processed_action.clone()
+    
+#     # =================================================================
+#     # 🛡️ 三重安全逻辑: 滤波(Smoothing) + 限位(Safe Zone) + 限速(Speed Limit)
+#     # =================================================================
+    
+#     # 1. 检查是否有人工介入
+#     is_intervention = False
+#     if TransitionKey.INFO in processed_action_transition:
+#         info = processed_action_transition[TransitionKey.INFO]
+#         is_rb_pressed = info.get(TeleopEvents.IS_INTERVENTION, False)
+#         is_success_pressed = info.get(TeleopEvents.SUCCESS, False)
+#         is_failure_pressed = info.get(TeleopEvents.FAILURE, False)
+#         is_rerecord_pressed = info.get(TeleopEvents.RERECORD_EPISODE, False)
+        
+#         if is_success_pressed: print("💡 User Signal: SUCCESS (Y)")
+#         if is_rerecord_pressed: print("💡 User Signal: RERECORD/RESET (X)")
+            
+#         is_intervention = is_rb_pressed or is_success_pressed or is_failure_pressed or is_rerecord_pressed
+    
+#     # 如果介入了，清空 Policy 平滑器的记忆，避免下次接管时跳变
+#     if is_intervention:
+#         env.last_policy_action = None
+
+#     # 2. 如果是 Policy 控制 (非介入状态)，执行平滑和限制
+#     if not is_intervention and isinstance(robot_action, torch.Tensor):
+#         POLICY_MAX_STEP = 0.04  # 速度上限
+#         EMA_ALPHA = 0.2         # 平滑系数 (0.1~1.0)，越小越顺滑但延迟越高
+        
+#         joint_names = list(env.robot.bus.motors.keys()) 
+#         current_pos_list = [raw_joints[f"{name}.pos"] for name in joint_names]
+        
+#         current_pos_tensor = torch.tensor(
+#             current_pos_list, 
+#             device=robot_action.device, 
+#             dtype=robot_action.dtype
+#         )
+        
+#         # [A] 提取关节目标 & 增加 Batch 维度
+#         arm_target = None
+#         arm_current = None
+        
+#         if robot_action.ndim == 2: # [Batch, 7]
+#             arm_target = robot_action[:, :6] 
+#             arm_current = current_pos_tensor[:6].unsqueeze(0)
+#         elif robot_action.ndim == 1: # [7]
+#             arm_target = robot_action[:6]
+#             arm_current = current_pos_tensor[:6]
+            
+#         if arm_target is not None:
+#             # [B] EMA 平滑滤波 (Anti-Jitter)
+#             # ----------------------------------------------------
+#             last_action = env.last_policy_action
+            
+#             # 如果没有历史记录（刚开始或刚结束介入），用当前真实位置初始化
+#             # 这样保证从静止开始启动，不会突变
+#             if last_action is None:
+#                 last_action = arm_current.clone()
+            
+#             # 确保维度匹配 (处理 Batch 广播)
+#             if last_action.ndim != arm_target.ndim:
+#                 if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
+                
+#             # 执行滤波公式: Smoothed = alpha * New + (1-alpha) * Old
+#             arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
+            
+#             # 更新记忆
+#             env.last_policy_action = arm_target_smoothed.detach() # detach防止梯度累积
+#             # ----------------------------------------------------
+
+#             # [C] Policy 安全屋 (使用平滑后的目标)
+#             for i in range(6):
+#                 min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
+#                 if robot_action.ndim == 2:
+#                     arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
+#                 else:
+#                     arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
+
+#             # [D] 速度限制 (基于平滑后的目标计算 Delta)
+#             delta = arm_target_smoothed - arm_current
+#             delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
+            
+#             # [E] 写回 robot_action
+#             if robot_action.ndim == 2:
+#                 robot_action[:, :6] = arm_current + delta_clipped
+#             else:
+#                 robot_action[:6] = arm_current + delta_clipped
+
+#     # =================================================================
+
+#     if isinstance(robot_action, torch.Tensor):
+#         robot_action = robot_action.cpu().numpy()
+    
+#     if robot_action.ndim > 1:
+#         robot_action = robot_action.squeeze(0)
+
+#     obs, reward, terminated, truncated, info = env.step(robot_action)
 
 #     reward = reward + processed_action_transition[TransitionKey.REWARD]
 #     terminated = terminated or processed_action_transition[TransitionKey.DONE]
@@ -682,172 +931,12 @@ def step_env_and_process_transition(
 #         info=new_info,
 #         complementary_data=complementary_data,
 #     )
+    
 #     new_transition = env_processor(new_transition)
 
 #     return new_transition
 
 
-# def control_loop(
-#     env: gym.Env,
-#     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
-#     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
-#     teleop_device: Teleoperator,
-#     cfg: GymManipulatorConfig,
-# ) -> None:
-#     """Main control loop for robot environment interaction.
-#     if cfg.mode == "record": then a dataset will be created and recorded
-
-#     Args:
-#      env: The robot environment
-#      env_processor: Environment processor
-#      action_processor: Action processor
-#      teleop_device: Teleoperator device
-#      cfg: gym_manipulator configuration
-#     """
-#     dt = 1.0 / cfg.env.fps
-
-#     print(f"Starting control loop at {cfg.env.fps} FPS")
-#     print("Controls:")
-#     print("- Use gamepad/teleop device for intervention")
-#     print("- When not intervening, robot will stay still")
-#     print("- Press Ctrl+C to exit")
-
-#     # Reset environment and processors
-#     obs, info = env.reset()
-#     complementary_data = (
-#         {"raw_joint_positions": info.pop("raw_joint_positions")} if "raw_joint_positions" in info else {}
-#     )
-#     env_processor.reset()
-#     action_processor.reset()
-
-#     # Process initial observation
-#     transition = create_transition(observation=obs, info=info, complementary_data=complementary_data)
-#     transition = env_processor(data=transition)
-
-#     # Determine if gripper is used
-#     use_gripper = cfg.env.processor.gripper.use_gripper if cfg.env.processor.gripper is not None else True
-
-#     dataset = None
-#     if cfg.mode == "record":
-#         action_features = teleop_device.action_features
-#         features = {
-#             ACTION: action_features,
-#             REWARD: {"dtype": "float32", "shape": (1,), "names": None},
-#             DONE: {"dtype": "bool", "shape": (1,), "names": None},
-#         }
-#         if use_gripper:
-#             features["complementary_info.discrete_penalty"] = {
-#                 "dtype": "float32",
-#                 "shape": (1,),
-#                 "names": ["discrete_penalty"],
-#             }
-
-#         for key, value in transition[TransitionKey.OBSERVATION].items():
-#             if key == OBS_STATE:
-#                 features[key] = {
-#                     "dtype": "float32",
-#                     "shape": value.squeeze(0).shape,
-#                     "names": None,
-#                 }
-#             if "image" in key:
-#                 features[key] = {
-#                     "dtype": "video",
-#                     "shape": value.squeeze(0).shape,
-#                     "names": ["channels", "height", "width"],
-#                 }
-
-#         # Create dataset
-#         dataset = LeRobotDataset.create(
-#             cfg.dataset.repo_id,
-#             cfg.env.fps,
-#             root=cfg.dataset.root,
-#             use_videos=True,
-#             image_writer_threads=4,
-#             image_writer_processes=0,
-#             features=features,
-#         )
-
-#     episode_idx = 0
-#     episode_step = 0
-#     episode_start_time = time.perf_counter()
-
-#     while episode_idx < cfg.dataset.num_episodes_to_record:
-#         step_start_time = time.perf_counter()
-
-#         # Create a neutral action (no movement)
-#         neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-#         if use_gripper:
-#             neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
-
-#         # Use the new step function
-#         transition = step_env_and_process_transition(
-#             env=env,
-#             transition=transition,
-#             action=neutral_action,
-#             env_processor=env_processor,
-#             action_processor=action_processor,
-#         )
-#         terminated = transition.get(TransitionKey.DONE, False)
-#         truncated = transition.get(TransitionKey.TRUNCATED, False)
-
-#         if cfg.mode == "record":
-#             observations = {
-#                 k: v.squeeze(0).cpu()
-#                 for k, v in transition[TransitionKey.OBSERVATION].items()
-#                 if isinstance(v, torch.Tensor)
-#             }
-#             # Use teleop_action if available, otherwise use the action from the transition
-#             action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
-#                 "teleop_action", transition[TransitionKey.ACTION]
-#             )
-#             frame = {
-#                 **observations,
-#                 ACTION: action_to_record.cpu(),
-#                 REWARD: np.array([transition[TransitionKey.REWARD]], dtype=np.float32),
-#                 DONE: np.array([terminated or truncated], dtype=bool),
-#             }
-#             if use_gripper:
-#                 discrete_penalty = transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)
-#                 frame["complementary_info.discrete_penalty"] = np.array([discrete_penalty], dtype=np.float32)
-
-#             if dataset is not None:
-#                 frame["task"] = cfg.dataset.task
-#                 dataset.add_frame(frame)
-
-#         episode_step += 1
-
-#         # Handle episode termination
-#         if terminated or truncated:
-#             episode_time = time.perf_counter() - episode_start_time
-#             logging.info(
-#                 f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
-#             )
-#             episode_step = 0
-#             episode_idx += 1
-
-#             if dataset is not None:
-#                 if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
-#                     logging.info(f"Re-recording episode {episode_idx}")
-#                     dataset.clear_episode_buffer()
-#                     episode_idx -= 1
-#                 else:
-#                     logging.info(f"Saving episode {episode_idx}")
-#                     dataset.save_episode()
-
-#             # Reset for new episode
-#             obs, info = env.reset()
-#             env_processor.reset()
-#             action_processor.reset()
-
-#             transition = create_transition(observation=obs, info=info)
-#             transition = env_processor(transition)
-
-#         # Maintain fps timing
-#         busy_wait(dt - (time.perf_counter() - step_start_time))
-
-#     if dataset is not None and cfg.dataset.push_to_hub:
-#         logging.info("Pushing dataset to hub")
-#         dataset.push_to_hub()
 
 def control_loop(
     env: gym.Env,
@@ -856,25 +945,15 @@ def control_loop(
     teleop_device: Teleoperator,
     cfg: GymManipulatorConfig,
 ) -> None:
-    """Main control loop for robot environment interaction.
-    if cfg.mode == "record": then a dataset will be created and recorded
-
-    Args:
-     env: The robot environment
-     env_processor: Environment processor
-     action_processor: Action processor
-     teleop_device: Teleoperator device
-     cfg: gym_manipulator configuration
-    """
     dt = 1.0 / cfg.env.fps
 
     print(f"Starting control loop at {cfg.env.fps} FPS")
     print("Controls:")
-    print("- Use gamepad/teleop device for intervention")
-    print("- When not intervening, robot will stay still")
-    print("- Press Ctrl+C to exit")
+    print("- Long Press Y (1s): START Exploration")
+    print("- Long Press X (1s): STOP & Return to ZERO")
+    print("- Hold RB: Manual Intervention")
+    print(f"Current Mode: {env.rl_mode}")
 
-    # Reset environment and processors
     obs, info = env.reset()
     complementary_data = (
         {"raw_joint_positions": info.pop("raw_joint_positions")} if "raw_joint_positions" in info else {}
@@ -882,11 +961,9 @@ def control_loop(
     env_processor.reset()
     action_processor.reset()
 
-    # Process initial observation
     transition = create_transition(observation=obs, info=info, complementary_data=complementary_data)
     transition = env_processor(data=transition)
 
-    # Determine if gripper is used
     use_gripper = cfg.env.processor.gripper.use_gripper if cfg.env.processor.gripper is not None else True
 
     dataset = None
@@ -918,7 +995,6 @@ def control_loop(
                     "names": ["channels", "height", "width"],
                 }
 
-        # Create dataset
         dataset = LeRobotDataset.create(
             cfg.dataset.repo_id,
             cfg.env.fps,
@@ -931,27 +1007,19 @@ def control_loop(
 
     episode_idx = 0
     episode_step = 0
-    episode_success_frames = 0  # [新增] 初始化成功帧计数器
+    episode_success_frames = 0
     episode_start_time = time.perf_counter()
 
-    #初始化 Neutral Action 为当前机械臂的实际位置
     current_joints = env.get_raw_joint_positions()
-    # 注意：确保 key 的顺序与 env._joint_names 一致
     joint_names = list(env.robot.bus.motors.keys())
     neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
 
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
-        # Create a neutral action (no movement)
-        #neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-        #if use_gripper:
-        #    neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
-        #确保 neutral_action 是 Tensor 格式传入
         if not isinstance(neutral_action, torch.Tensor):
              neutral_action = torch.from_numpy(neutral_action).float()
 
-        # Use the new step function
         transition = step_env_and_process_transition(
             env=env,
             transition=transition,
@@ -960,39 +1028,27 @@ def control_loop(
             action_processor=action_processor,
         )
 
-        #更新 neutral_action 为当前帧实际执行的动作
-        # 这样如果没有人工介入，下一帧就会继续维持这个姿态
-        executed_action = transition[TransitionKey.ACTION]
-        if isinstance(executed_action, np.ndarray):
-            neutral_action = torch.from_numpy(executed_action).float()
-        else:
-            neutral_action = executed_action.clone()
+        # [Anti-Windup Logic] 每次循环后，重置 neutral_action 为当前真实位置
+        # 解决 Policy 或 手柄 操作后的位置偏差
+        obs_dict = transition[TransitionKey.OBSERVATION]
+        current_joint_vals = []
+        for name in joint_names:
+             key = f"{name}.pos"
+             val = obs_dict[key]
+             if hasattr(val, "item"):
+                 val = val.item()
+             current_joint_vals.append(val)
+        neutral_action = torch.tensor(current_joint_vals, dtype=torch.float32)
 
-        #实时打印图像统计信息 
-        # 从 transition 中获取处理过的观测数据 (这是喂给 Reward Model 的数据)
-        proc_obs = transition[TransitionKey.OBSERVATION]
-        
-        stats_msg = []
-        for key, value in proc_obs.items():
-            if "image" in key and isinstance(value, torch.Tensor):
-                # value通常是 (Batch, Channel, Height, Width) 或 (C, H, W)
-                v_min = value.min().item()
-                v_max = value.max().item()
-                v_shape = list(value.shape)
-                stats_msg.append(f"{key}: {v_shape} [{v_min:.2f}, {v_max:.2f}]")
-        
-        # 打印在同一行 (加上之前的 episode 信息)
-        #print(f"Epi: {episode_idx} | Reward: {transition[TransitionKey.REWARD].item():.4f} | {' | '.join(stats_msg)}", end="\r")
+        # Print Info
         reward_val = transition[TransitionKey.REWARD]
         reward_val = reward_val.item() if hasattr(reward_val, "item") else reward_val
-        print(f"Epi: {episode_idx} | Reward: {reward_val:.4f} | {' | '.join(stats_msg)}", end="\r")
+        print(f"Epi: {episode_idx} | Reward: {reward_val:.4f} | Steps: {episode_step}", end="\r")
 
         terminated = transition.get(TransitionKey.DONE, False)
         truncated = transition.get(TransitionKey.TRUNCATED, False)
 
-        # [新增] 统计成功帧数
-        current_reward = transition[TransitionKey.REWARD]
-        if current_reward > 0.0:  # 假设大于0即为获得奖励（成功）
+        if reward_val > 0.0:
             episode_success_frames += 1
 
         if cfg.mode == "record":
@@ -1001,7 +1057,6 @@ def control_loop(
                 for k, v in transition[TransitionKey.OBSERVATION].items()
                 if isinstance(v, torch.Tensor)
             }
-            # Use teleop_action if available, otherwise use the action from the transition
             action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
                 "teleop_action", transition[TransitionKey.ACTION]
             )
@@ -1019,31 +1074,25 @@ def control_loop(
                 frame["task"] = cfg.dataset.task
                 dataset.add_frame(frame)
 
-        # [新增] 实时打印当前状态和累积成功帧数
-        print(f"Episode: {episode_idx} | Step: {episode_step} | Success Frames: {episode_success_frames} (Target: >50)", end="\r")
-
         episode_step += 1
 
-        # Handle episode termination
-        #在 Episode 结束重置环境时，也要重置 neutral_action
         if terminated or truncated:
             episode_time = time.perf_counter() - episode_start_time
-            # [修改] 日志增加显示成功帧数
-            logging.info(
-                f"\nEpisode {episode_idx} ended after {episode_step} steps in {episode_time:.1f}s. "
-                f"Total Success Frames: {episode_success_frames} "
-                f"(Reward: {transition[TransitionKey.REWARD]})"
-            )
-            
-            if episode_success_frames < 30:
-                logging.warning("⚠️ 本回合成功帧数过少！建议重录并保持成功姿态更久。")
+            # 检测是否是因为用户手动重置
+            is_rerecord = transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False)
+            if is_rerecord:
+                logging.info(f"\n🔄 Episode {episode_idx} RESET by USER (Button X). Reward={reward_val}")
+            else:
+                logging.info(
+                    f"\n✅ Episode {episode_idx} finished. Steps: {episode_step}. Reward: {reward_val}"
+                )
 
             episode_step = 0
-            episode_success_frames = 0 # [新增] 重置计数器
+            episode_success_frames = 0
             episode_idx += 1
 
             if dataset is not None:
-                if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
+                if is_rerecord:
                     logging.info(f"Re-recording episode {episode_idx}")
                     dataset.clear_episode_buffer()
                     episode_idx -= 1
@@ -1051,20 +1100,17 @@ def control_loop(
                     logging.info(f"Saving episode {episode_idx}")
                     dataset.save_episode()
 
-            # Reset for new episode
             obs, info = env.reset()
             env_processor.reset()
             action_processor.reset()
 
-            # 重新获取重置后的位置作为新的 Hold 点
             current_joints = env.get_raw_joint_positions()
             neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
 
             transition = create_transition(observation=obs, info=info)
             transition = env_processor(transition)
-            episode_start_time = time.perf_counter() # [修正] 重置开始时间
+            episode_start_time = time.perf_counter()
 
-        # Maintain fps timing
         busy_wait(dt - (time.perf_counter() - step_start_time))
 
     if dataset is not None and cfg.dataset.push_to_hub:

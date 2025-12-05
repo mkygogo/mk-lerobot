@@ -22,6 +22,29 @@ logger = logging.getLogger(__name__)
 # Sim (URDF) <-> Real (Motor)
 HARDWARE_DIR = np.array([-1.0, 1.0, -1.0, -1.0, -1.0, -1.0]) # 前6轴
 
+# --- 🛡️ 安全配置：物理关节限位 (单位: 弧度) ---
+# 请根据您的 dk2.SLDASM.urdf 文件中的 limit lower/upper 进行核对修正
+# 这里提供的是一组相对安全的默认值
+JOINT_LIMITS = {
+    # 关节索引: (最小弧度, 最大弧度)
+    0: (-3.0, 3.0),  # Joint 1: 底座旋转 (通常范围很大)
+    1: (0.0, 3.0),  # Joint 2: 大臂 (注意避免撞地)
+    2: (0.0, 3.0),  # Joint 3: 肘部
+    3: (-1.7, 1.2),  # Joint 4: 腕部旋转
+    4: (-0.4, 0.4),  # Joint 5: 腕部弯曲
+    5: (-2.0, 2.0),  # Joint 6: 法兰旋转
+}
+
+# # 真实机械臂的物理限位 (用于发送指令前的安全截断)
+# REAL_JOINT_LIMITS = {
+#     "joint_1": [-3.0, 3.0],
+#     "joint_2": [-0.3, 3.0],
+#     "joint_3": [0.0, 3.0],   # 注意：这是正值区间
+#     "joint_4": [-1.7, 1.2],
+#     "joint_5": [-0.4, 0.4],  # 范围较窄
+#     "joint_6": [-2.0, 2.0]
+# }
+
 class MKBusAdapter:
     """
     伪装成 DynamixelBus，为 gym_manipulator 提供 sync_read/write 接口。
@@ -63,6 +86,9 @@ class MKRobotConfig(RobotConfig):
     type: str = "mk_robot"
     port: str = "/dev/ttyACM0"
     joint_velocity_scaling: float = 1.0
+    # 0.15 rad ≈ 8.6度。在30Hz下允许最大角速度约 4.5 rad/s。
+    # 这既能跟上 Reset 指令，又能防止 RL 策略输出 3.14 时的飞车事故。
+    max_step_rad: float = 0.15
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
 class MKRobot(Robot):
@@ -95,6 +121,8 @@ class MKRobot(Robot):
         self.is_connected_flag = False
 
         self._bus_adapter = MKBusAdapter(self)
+        # 安全相关：记录上一次的目标位置，用于平滑处理
+        self.last_target_joints = None
 
     def connect(self):
         if not self.is_connected_flag:
@@ -106,6 +134,15 @@ class MKRobot(Robot):
                 cam.connect()
 
             self.is_connected_flag = True
+
+            # 连接时读取当前位置作为初始目标，防止一上电就跳变
+            init_obs = self.robot.get_observation()
+            if init_obs:
+                q_real = np.zeros(6)
+                for i in range(6):
+                    q_real[i] = init_obs.get(f'joint_{i+1}.pos', 0)
+                self.last_target_joints = q_real
+
             logger.info("✅ MKRobot: Connected!")
 
     def disconnect(self):
@@ -175,43 +212,129 @@ class MKRobot(Robot):
         return images
 
     # =========================================================
-    # 🕹️ 核心收发逻辑
+    # 🛡️ 核心安全逻辑：速度平滑 + 绝对位置硬限位
     # =========================================================
 
     def send_action(self, action: torch.Tensor) -> torch.Tensor:
-        """
-        接收 Sim 坐标系动作 (URDF) -> 转换为 Real 动作 -> 发送
-        """
         if not self.is_connected: return action
 
-        # 1. 转换格式 (Tensor -> Numpy)
+        # 1. 格式转换
         if isinstance(action, torch.Tensor):
-            q_sim = action.cpu().numpy()
+            q_sim_target = action.cpu().numpy()
         else:
-            q_sim = action
+            q_sim_target = action
 
-        # 2. 关节角度映射 (Sim -> Real)
-        # 前6轴乘系数
-        q_real_joints = q_sim[:6] * HARDWARE_DIR
+        # 2. 映射到 Real 坐标系
+        q_real_target = q_sim_target[:6] * HARDWARE_DIR
+        g_real_target = np.clip(q_sim_target[6], 0.0, 1.0)
+
+        # 3. 读取当前真实位置
+        current_obs = self.robot.get_observation()
+        q_real_current = np.zeros(6)
+        for i in range(6):
+            q_real_current[i] = current_obs.get(f'joint_{i+1}.pos', 0)
+
+        # ---------------------------------------------------
+        # 🛡️ 优化后的安全逻辑: 先位置截断，再速度截断
+        # ---------------------------------------------------
         
-        # 3. 夹爪映射 (Sim -> Real)
-        # 假设 Teleop 输出的是归一化 0.0(Open)~1.0(Close)
-        # 如果你的真机是 1.0=Close, 0.0=Open，则直接用
-        g_real = np.clip(q_sim[6], 0.0, 1.0)
+        q_real_safe = np.zeros(6)
+        
+        for i in range(6):
+            # A. 获取限位
+            min_lim, max_lim = JOINT_LIMITS.get(i, (-3.14, 3.14))
+            
+            # B. 【关键】先将目标强行限制在物理限位内
+            # 这样无论 Policy 想要去多远的地方，我们只把它当做想要去边界
+            target_clamped = np.clip(q_real_target[i], min_lim, max_lim)
+            
+            # C. 计算 真实位置 -> 边界 的距离
+            delta = target_clamped - q_real_current[i]
+            
+            # D. 对这个距离进行限速 (平滑处理)
+            # 即使 current 在边界外 (例如 2.0, limit 1.6), delta 是 -0.4
+            # 也会被平滑限制为 -0.15, 从而安全地慢慢退回，而不是剧烈跳变
+            max_step = self.config.max_step_rad
+            delta_safe = np.clip(delta, -max_step, max_step)
+            
+            # E. 最终指令
+            q_real_safe[i] = q_real_current[i] + delta_safe
 
-        # 4. 组装字典发送
+        # 4. 发送最终的安全指令
         command = {
-            "joint_1.pos": q_real_joints[0],
-            "joint_2.pos": q_real_joints[1],
-            "joint_3.pos": q_real_joints[2],
-            "joint_4.pos": q_real_joints[3],
-            "joint_5.pos": q_real_joints[4],
-            "joint_6.pos": q_real_joints[5],
-            "gripper.pos": g_real
+            "joint_1.pos": q_real_safe[0],
+            "joint_2.pos": q_real_safe[1],
+            "joint_3.pos": q_real_safe[2],
+            "joint_4.pos": q_real_safe[3],
+            "joint_5.pos": q_real_safe[4],
+            "joint_6.pos": q_real_safe[5],
+            "gripper.pos": g_real_target
         }
         self.robot.send_action(command)
         
         return action
+
+    # # =========================================================
+    # # 🕹️ 核心收发逻辑
+    # # =========================================================
+
+    # def send_action(self, action: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     接收 Sim 坐标系动作 (URDF) -> 转换为 Real 动作 -> 发送
+    #     """
+    #     if not self.is_connected: return action
+
+    #     # 1. 转换格式 (Tensor -> Numpy)
+    #     if isinstance(action, torch.Tensor):
+    #         q_sim = action.cpu().numpy()
+    #     else:
+    #         q_sim = action
+
+    #     # 2. 关节角度映射 (Sim -> Real)
+    #     # 前6轴乘系数
+    #     q_real_target = q_sim[:6] * HARDWARE_DIR
+        
+    #     # 3. 夹爪映射 (Sim -> Real)
+    #     # 假设 Teleop 输出的是归一化 0.0(Open)~1.0(Close)
+    #     # 如果你的真机是 1.0=Close, 0.0=Open，则直接用
+    #     g_real = np.clip(q_sim[6], 0.0, 1.0)
+
+    #     # --- 🛡️ 安全限速核心代码 START ---
+    #     # 读取当前真实的电机位置
+    #     current_obs = self.robot.get_observation()
+    #     q_real_current = np.zeros(6)
+    #     for i in range(6):
+    #         q_real_current[i] = current_obs.get(f'joint_{i+1}.pos', 0)
+
+    #     # 计算这一帧想移动的量 (Target - Current)
+    #     delta = q_real_target - q_real_current
+        
+    #     # 强制截断：每帧最大只能移动 config.max_step_rad (默认0.05)
+    #     # 这样即使策略输出 3.14，也只会移动 0.05，变成平滑的运动
+    #     max_step = self.config.max_step_rad
+    #     delta_clipped = np.clip(delta, -max_step, max_step)
+        
+    #     # 计算出实际发送给电机的安全目标
+    #     q_real_safe = q_real_current + delta_clipped
+        
+    #     # 更新 gripper (夹爪通常不需要平滑，或者可以给大一点的阈值)
+    #     # 这里直接通过
+    #     # --- 🛡️ 安全限速核心代码 END ---
+
+
+    #     # 4. 组装字典发送
+    #     command = {
+    #         "joint_1.pos": q_real_safe[0],
+    #         "joint_2.pos": q_real_safe[1],
+    #         "joint_3.pos": q_real_safe[2],
+    #         "joint_4.pos": q_real_safe[3],
+    #         "joint_5.pos": q_real_safe[4],
+    #         "joint_6.pos": q_real_safe[5],
+    #         "gripper.pos": g_real
+    #     }
+    #     self.robot.send_action(command)
+        
+    #     return action
 
     def get_observation(self) -> Dict[str, Any]:
         """
