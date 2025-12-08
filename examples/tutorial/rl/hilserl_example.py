@@ -274,10 +274,19 @@ demonstrations_repo_id = "lerobot/example_hil_serl_dataset"
 offline_dataset = LeRobotDataset(repo_id=demonstrations_repo_id)
 
 # Online buffer: initialized from scratch
-online_replay_buffer = ReplayBuffer(device=device, state_keys=list(obs_features.keys()))
+online_replay_buffer = ReplayBuffer(
+    device=device, 
+    state_keys=list(obs_features.keys()),
+    capacity=8000,  # <--- [新增] 限制容量，例如 2万帧
+    optimize_memory=True # <--- [确认] 确保这个开关打开了    
+    )
 # Offline buffer: Created from dataset (pre-populated it with demonstrations)
 offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
-    lerobot_dataset=offline_dataset, device=device, state_keys=list(obs_features.keys())
+    lerobot_dataset=offline_dataset, 
+    device=device, 
+    state_keys=list(obs_features.keys()),
+    capacity=8000, # <--- [新增] 限制容量
+    optimize_memory=True # <--- [确认] 确保这个开关打开了    
 )
 
 # Create communication channels between learner and actor processes
