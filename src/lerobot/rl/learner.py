@@ -568,6 +568,24 @@ def add_actor_information_and_train(
             if wandb_logger:
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
 
+            # --- 👇 新增：自定义终端观测日志 👇 ---
+            # 提取关键指标，使用 .get() 防止某些步骤没有更新 Actor 导致报错
+            act_loss = training_infos.get("loss_actor", 0.0)
+            cri_loss = training_infos.get("loss_critic", 0.0)
+            temp_val = training_infos.get("temperature", 0.0)
+            buff_size = len(replay_buffer)
+            
+            # 格式化打印
+            log_msg = (
+                f"\n📊 [Step {optimization_step}] Status Report:\n"
+                f"  ➤ Replay Buffer : {buff_size}\n"
+                f"  ➤ Actor Loss    : {act_loss:.4f}\n"
+                f"  ➤ Critic Loss   : {cri_loss:.4f}\n"
+                f"  ➤ Alpha (Temp)  : {temp_val:.4f}\n"
+            )
+            logging.info(log_msg)
+            # --- 👆 新增结束 👆 ---
+
         # Calculate and log optimization frequency
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)

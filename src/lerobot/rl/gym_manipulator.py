@@ -498,6 +498,13 @@ def make_processors(
 
     # Add time limit processor if reset config exists
     if cfg.processor.reset is not None:
+        # --- 👇 新增调试打印 👇 ---
+        limit_steps = int(cfg.processor.reset.control_time_s * cfg.fps)
+        print(f"\n🛑 [PROCESSOR CHECK] Creating TimeLimitProcessorStep:")
+        print(f"   👉 Raw control_time_s: {cfg.processor.reset.control_time_s}")
+        print(f"   👉 Raw FPS: {cfg.fps}")
+        print(f"   👉 Final Max Episode Steps: {limit_steps} (Will run for this many frames)")
+        # --- 👆 新增结束 👆 ---
         env_pipeline_steps.append(
             TimeLimitProcessorStep(max_episode_steps=int(cfg.processor.reset.control_time_s * cfg.fps))
         )

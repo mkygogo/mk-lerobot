@@ -54,7 +54,7 @@ class GamepadIKTeleop(Teleoperator):
                 rot_speed=0.02
             )
         
-        super().__init__(config=config)
+        super().__init__(config=self.config)
 
         # 初始化 Core
         self.core = MKArmIKCore(self.config.urdf_path, 
