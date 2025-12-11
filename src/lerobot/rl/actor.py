@@ -235,6 +235,18 @@ def act_with_policy(
         init_logging(log_file=log_file, display_pid=True)
         logging.info("Actor policy process logging initialized")
 
+    # --- 👇 新增调试打印 👇 ---
+    print("\n" + "="*50)
+    print(f"🕵️ [DEBUG CHECK] Actor Configuration Loaded:")
+    if cfg.env.processor.reset:
+        print(f"   👉 control_time_s: {cfg.env.processor.reset.control_time_s}")
+        print(f"   👉 fps: {cfg.env.fps}")
+        print(f"   👉 calculated max_steps: {int(cfg.env.processor.reset.control_time_s * cfg.env.fps)}")
+    else:
+        print("   ❌ cfg.env.processor.reset is None!")
+    print("="*50 + "\n")
+    # --- 👆 新增结束 👆 ---
+
     logging.info("make_env online")
 
     online_env, teleop_device = make_robot_env(cfg=cfg.env)

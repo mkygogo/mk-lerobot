@@ -95,7 +95,9 @@ except ImportError:
     MKArmSafetyProcessorStep = None
     print("⚠️ Warning: MKArmSafetyProcessorStep not found. Safety checks will be disabled.")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("lerobot.src.lerobot.rl.learner").setLevel(logging.WARNING)
+logging.getLogger("lerobot.src.lerobot.rl.learner_service").setLevel(logging.WARNING)
 
 # --- 🛡️ 配置区域：Policy 安全屋 (训练活动范围) ---
 # 这里的范围应该比 mk_robot.py 里的物理硬限位要小 (建议 80%~90%)
@@ -104,7 +106,7 @@ POLICY_SAFE_LIMITS = {
     # 关节索引: (最小弧度, 最大弧度)
     0: (-1.0, 1.0), # Base
     1: (0.74, 1.70), # Shoulder (限制不要倒地)
-    2: (-0.42, -1.0), # Elbow
+    2: (-1.0, -0.42), # Elbow
     3: (-1.7, 1.2), # Wrist 1
     4: (-0.4, 0.4), # Wrist 2
     5: (-2.0, 2.0), # Wrist 3
@@ -230,9 +232,12 @@ class RobotEnv(gym.Env):
 
         if current_observation is not None:
             agent_pos = current_observation["agent_pos"]
+
             observation_spaces[OBS_STATE] = gym.spaces.Box(
-                low=0,
-                high=10,
+                #low=0,
+                #high=10,
+                low=-6.28, 
+                high=6.28,
                 shape=agent_pos.shape,
                 dtype=np.float32,
             )
@@ -316,7 +321,8 @@ class RobotEnv(gym.Env):
             reward,
             terminated,
             truncated,
-            {TeleopEvents.IS_INTERVENTION: False},
+            #{TeleopEvents.IS_INTERVENTION: False},
+            {},
         )
     # def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
     #     """Execute one environment step with given action."""
@@ -713,52 +719,113 @@ def step_env_and_process_transition(
 
     # [Case 4: EXPLORE 模式] Policy 控制 (带滤波和软限位)
     elif env.rl_mode == "EXPLORE":
-        # 如果没有介入，这里的 robot_action 是 Policy 的原始输出
+        # # 如果没有介入，这里的 robot_action 是 Policy 的原始输出
         
-        POLICY_MAX_STEP = 0.04
-        EMA_ALPHA = 0.2
+        # POLICY_MAX_STEP = 0.04
+        # EMA_ALPHA = 0.2
+        
+        # # 提取数据
+        # arm_target = None
+        # arm_current = None
+        # if robot_action.ndim == 2: 
+        #     arm_target = robot_action[:, :6] 
+        #     arm_current = current_pos_tensor[:6].unsqueeze(0)
+        # elif robot_action.ndim == 1:
+        #     arm_target = robot_action[:6]
+        #     arm_current = current_pos_tensor[:6]
+            
+        # if arm_target is not None:
+        #     # [滤波]
+        #     last_action = env.last_policy_action
+        #     if last_action is None: last_action = arm_current.clone()
+            
+        #     # 维度对齐
+        #     if last_action.ndim != arm_target.ndim:
+        #         if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
+            
+        #     # EMA 公式
+        #     arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
+        #     env.last_policy_action = arm_target_smoothed.detach()
+
+        #     # [软限位] Policy Safe Limits (在 gym_manipulator 顶部定义)
+        #     # 注意：这里的限位是给 Policy 的"活动范围"，可以比 SafetyProcessor 的硬限位更保守
+        #     for i in range(6):
+        #         min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
+        #         if robot_action.ndim == 2:
+        #             arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
+        #         else:
+        #             arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
+
+        #     # [限速]
+        #     delta = arm_target_smoothed - arm_current
+        #     delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
+            
+        #     if robot_action.ndim == 2:
+        #         robot_action[:, :6] = arm_current + delta_clipped
+        #     else:
+        #         robot_action[:6] = arm_current + delta_clipped
+
+        # 如果没有介入，这里的 robot_action 是 Policy 的原始输出 (范围 -1 ~ 1)
+        
+        # === 修改开始: 改为 Delta Control ===
+        
+        # 定义 Action Scale: Policy 输出 1.0 代表一步移动多少弧度？
+        # 建议设小一点，保证动作细腻。例如 0.05 rad/step
+        ACTION_SCALE = 0.05 
         
         # 提取数据
-        arm_target = None
+        policy_output_delta = None
         arm_current = None
+        
         if robot_action.ndim == 2: 
-            arm_target = robot_action[:, :6] 
+            policy_output_delta = robot_action[:, :6] 
             arm_current = current_pos_tensor[:6].unsqueeze(0)
         elif robot_action.ndim == 1:
-            arm_target = robot_action[:6]
+            policy_output_delta = robot_action[:6]
             arm_current = current_pos_tensor[:6]
             
-        if arm_target is not None:
-            # [滤波]
-            last_action = env.last_policy_action
-            if last_action is None: last_action = arm_current.clone()
+        if policy_output_delta is not None:
+            # 1. 计算目标位置: Target = Current + (Policy_Output * Scale)
+            # 这样如果 Policy 输出 0 (未知/犹豫)，机械臂就会停在原地，而不是归零
+            delta = policy_output_delta * ACTION_SCALE
             
-            # 维度对齐
-            if last_action.ndim != arm_target.ndim:
-                if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
+            # 2. [可选] 仍然保留平滑滤波，但作用在 Delta 上可能导致滞后，
+            # 建议直接作用在最终 Target 上，或者在 Delta Control 下暂时去掉 EMA，
+            # 因为 SAC 本身输出就是连续变化的。为了简单，我们先计算出 Target。
+            arm_target = arm_current + delta
             
-            # EMA 公式
-            arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
-            env.last_policy_action = arm_target_smoothed.detach()
-
-            # [软限位] Policy Safe Limits (在 gym_manipulator 顶部定义)
-            # 注意：这里的限位是给 Policy 的"活动范围"，可以比 SafetyProcessor 的硬限位更保守
+            # 3. [软限位] Policy Safe Limits
+            # 限制 Target 不要超出安全范围
             for i in range(6):
                 min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
                 if robot_action.ndim == 2:
-                    arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
+                    arm_target[:, i] = torch.clamp(arm_target[:, i], min_lim, max_lim)
                 else:
-                    arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
+                    arm_target[i] = torch.clamp(arm_target[i], min_lim, max_lim)
 
-            # [限速]
-            delta = arm_target_smoothed - arm_current
-            delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
-            
+            # 4. [最终赋值]
+            # 因为我们是基于 Current 算的 Delta，所以不需要再做额外的限速 (ACTION_SCALE 就是限速)
             if robot_action.ndim == 2:
-                robot_action[:, :6] = arm_current + delta_clipped
+                robot_action[:, :6] = arm_target
             else:
-                robot_action[:6] = arm_current + delta_clipped
+                robot_action[:6] = arm_target
 
+            if env.current_step % 5 == 0: # 提高频率观察
+                # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
+                j0_curr = arm_current.squeeze()[0].item()
+                j0_targ = arm_target.squeeze()[0].item()
+                
+                # 打印格式: [Step] J0_Curr -> J0_Target (Policy_Delta)
+                # 如果 J0 角度很大，且还在往大变，就很危险
+                raw_d = policy_output_delta.squeeze()[0].item()
+                print(f"⚠️ [Step {env.current_step}] J0(Base): {j0_curr:.3f} -> {j0_targ:.3f} (Delta_Raw: {raw_d:.2f})")
+                
+                # 检查是否贴近限位边界
+                for i in range(3): # 只检查前3个主要关节
+                    min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-99, 99))
+                    curr_val = arm_current.squeeze()[i].item()
+                    if curr_val < min_lim + 0.05 or curr_val > max_lim - 0.05:
+                        print(f"  🚨 DANGER ZONE: Joint {i} at {curr_val:.3f} is near limit {min_lim}~{max_lim}!")
     # -------------------------------------------------------------------------
     # 格式转换回 Numpy 发送给 Robot
     if isinstance(robot_action, torch.Tensor):
@@ -777,8 +844,15 @@ def step_env_and_process_transition(
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+    
+    #new_info = processed_action_transition[TransitionKey.INFO].copy()
+    #new_info.update(info)
+    env_info = info.copy()
+    # 移除 env_info 中的硬编码 False，避免覆盖
+    if TeleopEvents.IS_INTERVENTION in env_info:
+        del env_info[TeleopEvents.IS_INTERVENTION]
     new_info = processed_action_transition[TransitionKey.INFO].copy()
-    new_info.update(info)
+    new_info.update(env_info)    
 
     new_transition = create_transition(
         observation=obs,
