@@ -150,6 +150,11 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     init_logging(log_file=log_file, display_pid=display_pid)
     logging.info(f"Learner logging initialized, writing to {log_file}")
     logging.info(pformat(cfg.to_dict()))
+    logging.getLogger("lerobot.rl.learner_service").setLevel(logging.WARNING)
+    #屏蔽 Pillow (PIL) 的图像流日志 (解决 gePlugin.py 刷屏)
+    logging.getLogger("PIL").setLevel(logging.INFO)
+    #屏蔽 Transport 传输层 (解决 ort/utils.py 刷屏)
+    logging.getLogger("lerobot.transport").setLevel(logging.WARNING)
 
     # Setup WandB logging if enabled
     if cfg.wandb.enable and cfg.wandb.project:

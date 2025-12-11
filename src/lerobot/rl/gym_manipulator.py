@@ -99,6 +99,14 @@ logging.basicConfig(level=logging.WARNING)
 logging.getLogger("lerobot.src.lerobot.rl.learner").setLevel(logging.WARNING)
 logging.getLogger("lerobot.src.lerobot.rl.learner_service").setLevel(logging.WARNING)
 
+
+# 屏蔽 MKRobot 驱动的读取耗时日志 对应文件: src/lerobot/robots/mkrobot/follower_mkarm.py
+logging.getLogger("lerobot.robots.mkrobot.follower_mkarm").setLevel(logging.INFO)
+logging.getLogger("lerobot.robots.mkrobot").setLevel(logging.INFO)
+
+# 屏蔽 OpenCV 摄像头的读取耗时日志 对应文件: src/lerobot/cameras/opencv/camera_opencv.py
+logging.getLogger("lerobot.cameras.opencv.camera_opencv").setLevel(logging.INFO)
+
 # --- 🛡️ 配置区域：Policy 安全屋 (训练活动范围) ---
 # 这里的范围应该比 mk_robot.py 里的物理硬限位要小 (建议 80%~90%)
 # 确保 Policy 不会把机械臂扭成 IK 算不出来的麻花姿态，方便人工随时接管

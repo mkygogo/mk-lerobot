@@ -26,6 +26,7 @@ from lerobot.transport.utils import receive_bytes_in_chunks, send_bytes_in_chunk
 MAX_WORKERS = 3  # Stream parameters, send transitions and interactions
 SHUTDOWN_TIMEOUT = 10
 
+logger = logging.getLogger(__name__)
 
 class LearnerService(services_pb2_grpc.LearnerServiceServicer):
     """
@@ -52,7 +53,7 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
 
     def StreamParameters(self, request, context):  # noqa: N802
         # TODO: authorize the request
-        logging.info("[LEARNER] Received request to stream parameters from the Actor")
+        logger.info("[LEARNER] Received request to stream parameters from the Actor")
 
         last_push_time = 0
 
@@ -64,7 +65,7 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
                 # and it's checked in the while loop
                 continue
 
-            logging.info("[LEARNER] Push parameters to the Actor")
+            logger.info("[LEARNER] Push parameters to the Actor")
             buffer = get_last_item_from_queue(
                 self.parameters_queue, block=True, timeout=self.queue_get_timeout
             )
@@ -80,14 +81,14 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             )
 
             last_push_time = time.time()
-            logging.info("[LEARNER] Parameters sent")
+            logger.info("[LEARNER] Parameters sent")
 
-        logging.info("[LEARNER] Stream parameters finished")
+        logger.info("[LEARNER] Stream parameters finished")
         return services_pb2.Empty()
 
     def SendTransitions(self, request_iterator, _context):  # noqa: N802
         # TODO: authorize the request
-        logging.info("[LEARNER] Received request to receive transitions from the Actor")
+        logger.info("[LEARNER] Received request to receive transitions from the Actor")
 
         receive_bytes_in_chunks(
             request_iterator,
@@ -96,12 +97,12 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             log_prefix="[LEARNER] transitions",
         )
 
-        logging.debug("[LEARNER] Finished receiving transitions")
+        logger.debug("[LEARNER] Finished receiving transitions")
         return services_pb2.Empty()
 
     def SendInteractions(self, request_iterator, _context):  # noqa: N802
         # TODO: authorize the request
-        logging.info("[LEARNER] Received request to receive interactions from the Actor")
+        logger.info("[LEARNER] Received request to receive interactions from the Actor")
 
         receive_bytes_in_chunks(
             request_iterator,
@@ -110,7 +111,7 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             log_prefix="[LEARNER] interactions",
         )
 
-        logging.debug("[LEARNER] Finished receiving interactions")
+        logger.debug("[LEARNER] Finished receiving interactions")
         return services_pb2.Empty()
 
     def Ready(self, request, context):  # noqa: N802
