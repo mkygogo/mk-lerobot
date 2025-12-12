@@ -769,6 +769,14 @@ def save_training_checkpoint(
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+
+    # [新增逻辑] 动态从 Config 中提取 VISUAL 类型的特征键
+    # 这样只有配置文件里定义为 VISUAL 的才会被当做视频保存，完全由配置驱动
+    video_keys = [
+        key for key, feat in cfg.policy.input_features.items() 
+        if feat.type == "VISUAL"
+    ]
+
     replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
     if offline_replay_buffer is not None:
@@ -780,6 +788,7 @@ def save_training_checkpoint(
             cfg.dataset.repo_id,
             fps=fps,
             root=dataset_offline_dir,
+            video_keys=video_keys  # <--- 传给 Buffer 保存视频数据
         )
 
     logging.info("Resume training")

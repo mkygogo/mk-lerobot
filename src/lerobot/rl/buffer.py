@@ -621,12 +621,17 @@ class ReplayBuffer:
         fps=1,
         root=None,
         task_name="from_replay_buffer",
+        video_keys: Sequence[str] | None = None, #接收视频键列表
     ) -> LeRobotDataset:
         """
         Converts all transitions in this ReplayBuffer into a single LeRobotDataset object.
         """
         if self.size == 0:
             raise ValueError("The replay buffer is empty. Cannot convert to a dataset.")
+
+        # [新增逻辑] 确保 video_keys 是一个列表
+        if video_keys is None:
+            video_keys = []
 
         # Create features dictionary for the dataset
         features = {
@@ -650,15 +655,28 @@ class ReplayBuffer:
         for key in self.states:
             sample_val = self.states[key][0]
             f_info = guess_feature_info(t=sample_val, name=key)
+
+            # [修改逻辑] 如果该 Key 在指定的 video_keys 列表中，强制设为 video
+            if key in video_keys:
+                f_info["dtype"] = "video"
+
             features[key] = f_info
 
         # Add complementary_info keys if available
         if self.has_complementary_info:
             for key in self.complementary_info_keys:
+                # 注意：complementary_info 的 key 在 features 里通常会加上前缀
+                full_key = f"complementary_info.{key}"
+
                 sample_val = self.complementary_info[key][0]
                 if isinstance(sample_val, torch.Tensor) and sample_val.ndim == 0:
                     sample_val = sample_val.unsqueeze(0)
                 f_info = guess_feature_info(t=sample_val, name=f"complementary_info.{key}")
+
+                # [修改逻辑] 同样检查 complementary_info 的 key
+                if full_key in video_keys or key in video_keys:
+                    f_info["dtype"] = "video"
+                    
                 features[f"complementary_info.{key}"] = f_info
 
         # Create an empty LeRobotDataset
