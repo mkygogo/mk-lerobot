@@ -161,7 +161,15 @@ def run_actor(
                 policy_next_obs = make_policy_obs(next_obs, device=device)
                 reward = reward_classifier.predict_reward(policy_next_obs)
 
-                if reward >= 1.0 and not done:  # success detected! halt episode
+                # 确保 reward 是标量浮点数
+                #if hasattr(reward, "item"):
+                #    reward = float(reward.item())
+
+                # 🔥 [修正] 将阈值从 1.0 改为你认可的成功概率（例如 0.75）
+                # 这样当概率达到 0.7 时，既给 Agent 高分，也触发成功结束
+                SUCCESS_THRESHOLD = 0.7
+                print(f"reward in hilserl: {reward}", flush=True)
+                if reward >= SUCCESS_THRESHOLD and not done:  # success detected! halt episode
                     terminated = True
                     done = True
 

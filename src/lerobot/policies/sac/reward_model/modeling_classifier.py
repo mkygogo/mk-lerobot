@@ -282,7 +282,7 @@ class Classifier(PreTrainedPolicy):
 
         if self.config.num_classes == 2:
             probs = self.predict(images).probabilities
-            if probs.item() > 0.1:
+            if probs.item() > 0.0001:
                 print(f"--- 当前成功概率: {probs.item():.4f} (阈值: {threshold}) ---")
             logging.debug(f"Predicted reward images: {probs}")
             #return (probs > threshold).float()
