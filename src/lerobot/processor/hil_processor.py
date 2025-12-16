@@ -575,16 +575,33 @@ class RewardClassifierProcessorStep(ProcessorStep):
         # Run reward classifier
         start_time = time.perf_counter()
         with torch.inference_mode():
-            success = self.reward_classifier.predict_reward(images, threshold=self.success_threshold)
+            #success = self.reward_classifier.predict_reward(images, threshold=self.success_threshold)
+            # 获取概率值
+            success_prob = self.reward_classifier.predict_reward(images, threshold=self.success_threshold)
+            # 确保它是 python float
+            if isinstance(success_prob, torch.Tensor):
+                success_prob = success_prob.item()
 
         classifier_frequency = 1 / (time.perf_counter() - start_time)
 
         # Calculate reward and termination
         reward = new_transition.get(TransitionKey.REWARD, 0.0)
         terminated = new_transition.get(TransitionKey.DONE, False)
+        #原始代码，只有0或者1
+        # if math.isclose(success, 1, abs_tol=1e-2):
+        #     reward = self.success_reward
+        #     if self.terminate_on_success:
+        #         terminated = True
+        #修改：直接把概率赋值给 Reward
+        # 这样 Actor 就能收到 0.8 这样的数值了
+        reward = success_prob 
 
-        if math.isclose(success, 1, abs_tol=1e-2):
-            reward = self.success_reward
+        # [修改 2] 使用 threshold 来判断是否终止 (DONE)
+        # 注意：这里用 self.success_threshold (配置里通常是 0.5 或你设定的值)
+        if success_prob > self.success_threshold:
+            # 如果配置了达到成功就给满分奖励 (可选，看你是否想要 dense reward)
+            # reward = self.success_reward 
+            
             if self.terminate_on_success:
                 terminated = True
 

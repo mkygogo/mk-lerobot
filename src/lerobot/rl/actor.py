@@ -330,11 +330,11 @@ def act_with_policy(
         done = new_transition.get(TransitionKey.DONE, False)
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
-        print(f"🧐 DEBUG: Classifier says high prob, but Actor received reward: {reward}", flush=True)
+        #print(f"🧐 DEBUG: Classifier says high prob, but Actor received reward: {reward}", flush=True)
         # 强制成功判定：如果奖励大于 0.7，视为成功并结束
         # 即使环境还没判 done，我们也强制 done，防止机器人一直抓着不放
         current_reward_val = float(reward)
-        print(f"🧐 DEBUG: Classifier={current_reward_val:.4f} | ActorReceived={float(reward):.4f}", flush=True)
+        #print(f"🧐 DEBUG: Classifier={current_reward_val:.4f} | ActorReceived={float(reward):.4f}", flush=True)
         if current_reward_val >= 0.7 and not done:
             logging.info(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= 0.7)! Force resetting.")
             done = True
