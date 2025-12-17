@@ -292,4 +292,6 @@ class GamepadIKTeleop(Teleoperator):
             # --- 纯仿真模式 ---
             action_array = self.core.step(xyz_delta, manual)
 
+
+        print(f"action_array shape :{action_array.shape}")
         return torch.from_numpy(action_array).float()

@@ -23,7 +23,7 @@ class MKArmSafetyProcessorStep(ProcessorStep):
     3. 如果 Policy 违规，则保持在上一帧的安全位置 (Hold)。
     """
     urdf_path: str
-    min_z: float = 0.22  # Joint 4 (Link 4) 的最小高度，防止腕部撞桌子
+    min_z: float = 0.25  # Joint 4 (Link 4) 的最小高度，防止腕部撞桌子
     max_radius: float = 0.5 # 工作半径限制
     
     def __post_init__(self):

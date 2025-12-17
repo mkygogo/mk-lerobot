@@ -639,10 +639,10 @@ def step_env_and_process_transition(
     # 这里的 processed_action 可能是 Policy 动作，也可能是被替换后的人类动作
     processed_action_transition = action_processor(transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
-
+    print(f"processed_action shape: {processed_action.shape}")
     # 克隆最终决定执行的动作
     robot_action = processed_action.clone()
-    
+    print(f"robot_action shape0: {robot_action.shape}")
     # 获取当前真实位置 (用于滤波初始化和归零)
     joint_names = list(env.robot.bus.motors.keys()) 
     current_pos_list = [raw_joints[f"{name}.pos"] for name in joint_names]
@@ -678,8 +678,9 @@ def step_env_and_process_transition(
             env.rl_mode = "ZEROING"
             print("\n🛑 [System] STOPPED: Returning to ZERO... (X pressed)")
 
-    # 3. 根据当前模式修正 robot_action
+    print(f"robot_action shape1: {robot_action.shape}")
 
+    # 3. 根据当前模式修正 robot_action
     # [Case 1: 人工介入中]
     # 无论处于什么模式，只要按下了介入键，就听人类的。
     # 关键：在这里同步 Policy 的平滑器记忆，保证松手时 0 跳变。
@@ -691,7 +692,7 @@ def step_env_and_process_transition(
             env.last_policy_action = robot_action[:, :6].clone()
         else:
             env.last_policy_action = robot_action[:6].clone()
-            
+
     # [Case 2: 自动归零模式]
     elif env.rl_mode == "ZEROING":
         ZERO_SPEED = 0.05
@@ -802,6 +803,35 @@ def step_env_and_process_transition(
             # 因为 SAC 本身输出就是连续变化的。为了简单，我们先计算出 Target。
             arm_target = arm_current + delta
             
+            # 手动调用 SafetyProcessor 检查这个 arm_target (绝对值)
+            # 只有当 pipeline 里配置了 safety processor 时才执行
+            safety_step = None
+            for step in action_processor.steps:
+                if isinstance(step, MKArmSafetyProcessorStep):
+                    safety_step = step
+                    break
+                    
+            if safety_step is not None:
+                # 创建一个临时的 transition 专门用于检查 Target
+                # 注意：这里我们骗 Processor 说这是 action，实际上给的是绝对位置 target
+                check_transition = transition.copy()
+                check_transition[TransitionKey.ACTION] = arm_target  # 关键：传入绝对位置！
+                
+                # 复用 safety_processor 的逻辑
+                # 注意：需要修改 safety_processor 让它支持 return bool 或抛异常，
+                # 或者我们直接观察它是否修改了 action (回滚)
+                
+                # 更简单的做法：直接复用 safety_processor 里的核心检查函数
+                # 但由于它是 ProcessorStep，我们可以直接调用它
+                result_transition = safety_step(check_transition)
+                
+                # 如果 SafetyProcessor 发现违规，它会把 action 替换回 last_safe_action
+                # 我们检查 result_transition['action'] 是否变了，或者是否等于 arm_target
+                safe_action = result_transition[TransitionKey.ACTION]
+                # 使用 ... (Ellipsis) 可以同时处理 1D [7] 和 2D [B, 7] 的情况
+                safe_action_6d = safe_action[..., :6]
+                arm_target = safe_action_6d
+
             # 3. [软限位] Policy Safe Limits
             # 限制 Target 不要超出安全范围
             for i in range(6):
@@ -812,12 +842,23 @@ def step_env_and_process_transition(
                     arm_target[i] = torch.clamp(arm_target[i], min_lim, max_lim)
 
             # 4. [最终赋值]
+            #检查维度是否匹配，如果不匹配则 squeeze 掉多余的 batch 维度
+            # # 情况 A: robot_action 是 1D [7], 但 arm_target 是 2D [1, 6]
+            # # 解决: 把 arm_target 压扁成 [6]
+            # if robot_action.ndim == 1 and arm_target.ndim == 2:
+            #     arm_target = arm_target.squeeze(0)
+            # # 情况 B: robot_action 是 2D [1, 7], 但 arm_target 是 1D [6]
+            # # 解决: 把 arm_target 升维成 [1, 6]
+            # elif robot_action.ndim == 2 and arm_target.ndim == 1:
+            #     arm_target = arm_target.unsqueeze(0)
+
             # 因为我们是基于 Current 算的 Delta，所以不需要再做额外的限速 (ACTION_SCALE 就是限速)
             if robot_action.ndim == 2:
                 robot_action[:, :6] = arm_target
             else:
                 robot_action[:6] = arm_target
 
+            print(f"robot_action shape2: {robot_action.shape}")
             if env.current_step % 5 == 0: # 提高频率观察
                 # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
                 j0_curr = arm_current.squeeze()[0].item()
@@ -842,6 +883,7 @@ def step_env_and_process_transition(
     if robot_action.ndim > 1:
         robot_action = robot_action.squeeze(0)
 
+    print(f"robot_action shape: {robot_action.shape}")
     # 发送动作
     obs, reward, terminated, truncated, info = env.step(robot_action)
 
