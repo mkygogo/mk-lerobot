@@ -97,6 +97,13 @@ from .gym_manipulator import (
     step_env_and_process_transition,
 )
 
+try:
+    from lerobot.processor.safety_processor import MKArmSafetyProcessorStep
+    print("✅ [Actor] MKArmSafetyProcessorStep imported successfully.")
+except ImportError:
+    MKArmSafetyProcessorStep = None
+    print("⚠️ [Actor] MKArmSafetyProcessorStep NOT found.")
+
 # Main entry point
 
 
@@ -274,6 +281,26 @@ def act_with_policy(
     env_processor.reset()
     action_processor.reset()
 
+    safety_helper = None
+    try:
+        # 获取 URDF 路径 (需要从 cfg 中解析，或者硬编码)
+        # 注意：cfg 是 TrainRLServerPipelineConfig，结构可能略有不同
+        # 这里为了保险，建议直接硬编码路径测试，或者参考 gym_manipulator 的逻辑
+        urdf_path = None
+        if hasattr(cfg.env, "teleop") and cfg.env.teleop and hasattr(cfg.env.teleop, "urdf_path"):
+            urdf_path = os.path.abspath(cfg.env.teleop.urdf_path)
+        
+        print(f"🛡️ [Actor DEBUG] Try init Safety. Class: {MKArmSafetyProcessorStep}, Path: {urdf_path}")
+
+        if MKArmSafetyProcessorStep is not None and urdf_path:
+            safety_helper = MKArmSafetyProcessorStep(
+                urdf_path=urdf_path, 
+                min_z=0.26 # <--- 您的安全高度
+            )
+            logging.info(f"✅ [Actor] Safety Helper initialized!")
+    except Exception as e:
+        logging.warning(f"⚠️ [Actor] Safety init failed: {e}")
+        
     # Process initial observation
     transition = create_transition(observation=obs, info=info)
     transition = env_processor(transition)
@@ -313,6 +340,7 @@ def act_with_policy(
             action=action,
             env_processor=env_processor,
             action_processor=action_processor,
+            safety_helper=safety_helper,
         )
 
         # Extract values from processed transition

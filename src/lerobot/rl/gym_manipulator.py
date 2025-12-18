@@ -87,14 +87,6 @@ try:
 except ImportError as e:
     print(f"⚠️ 注册 MKRobot/GamepadIK 失败 (如果不是用这两个硬件可忽略): {e}")
 
-#导入我们刚写的安全处理器
-# 注意：如果没有这个文件，请确保你已经完成了上一步新建 safety_processor.py 的操作
-try:
-    from lerobot.processor.safety_processor import MKArmSafetyProcessorStep
-except ImportError:
-    MKArmSafetyProcessorStep = None
-    print("⚠️ Warning: MKArmSafetyProcessorStep not found. Safety checks will be disabled.")
-
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("lerobot.src.lerobot.rl.learner").setLevel(logging.WARNING)
 logging.getLogger("lerobot.src.lerobot.rl.learner_service").setLevel(logging.WARNING)
@@ -332,32 +324,6 @@ class RobotEnv(gym.Env):
             #{TeleopEvents.IS_INTERVENTION: False},
             {},
         )
-    # def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-    #     """Execute one environment step with given action."""
-    #     joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
-
-    #     self.robot.send_action(joint_targets_dict)
-
-    #     obs = self._get_observation()
-
-    #     self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-
-    #     if self.display_cameras:
-    #         self.render()
-
-    #     self.current_step += 1
-
-    #     reward = 0.0
-    #     terminated = False
-    #     truncated = False
-
-    #     return (
-    #         obs,
-    #         reward,
-    #         terminated,
-    #         truncated,
-    #         {TeleopEvents.IS_INTERVENTION: False},
-    #     )
 
     def render(self) -> None:
         """Display robot camera feeds."""
@@ -744,7 +710,7 @@ def step_env_and_process_transition(
         ACTION_SCALE = 0.05 
         # 0.04 弧度约等于 2.3度。这意味着每秒最大转速约 35度 (2.3 * 15Hz)
         MAX_DELTA_PER_STEP = 0.04  
-        
+        EMA_ALPHA = 0.15  # 平滑系数 (0.1~0.3)。越小越顺滑，但延迟越高；越大反应越快但越抖。
         # 提取数据
         policy_output_delta = None
         arm_current = None
@@ -764,7 +730,6 @@ def step_env_and_process_transition(
             delta = torch.clamp(delta, -MAX_DELTA_PER_STEP, MAX_DELTA_PER_STEP)
             target_raw = arm_current + delta
             
-            EMA_ALPHA = 0.15  # 平滑系数 (0.1~0.3)。越小越顺滑，但延迟越高；越大反应越快但越抖。
             # 如果是刚开始（或刚结束人工介入），初始化记忆为当前位置，防止飞车
             if env.last_policy_action is None:
                 env.last_policy_action = arm_current.clone()
@@ -801,6 +766,7 @@ def step_env_and_process_transition(
                 safe_full_action = result_transition[TransitionKey.ACTION]
                 # 如果安检后的动作和安检前差别很大，说明被 Safety 拦截并回滚了
                 diff = (safe_full_action - full_action_check).abs().max().item()
+                print(f"checking safety: {diff}")
                 if diff > 1e-4:
                     print(f"🛡️ [SAFETY BLOCK] Request denied! Diff: {diff:.4f}. Rolling back.")
 
@@ -847,11 +813,11 @@ def step_env_and_process_transition(
                 
                 # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
                 # 检查是否贴近限位边界
-                for i in range(3): # 只检查前3个主要关节
-                    min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-99, 99))
-                    curr_val = arm_current.squeeze()[i].item()
-                    if curr_val < min_lim + 0.05 or curr_val > max_lim - 0.05:
-                        print(f"  🚨 DANGER ZONE: Joint {i} at {curr_val:.3f} is near limit {min_lim}~{max_lim}!")
+                # for i in range(3): # 只检查前3个主要关节
+                #     min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-99, 99))
+                #     curr_val = arm_current.squeeze()[i].item()
+                #     if curr_val < min_lim + 0.05 or curr_val > max_lim - 0.05:
+                #         print(f"  🚨 DANGER ZONE: Joint {i} at {curr_val:.3f} is near limit {min_lim}~{max_lim}!")
     # -------------------------------------------------------------------------
     # 格式转换回 Numpy 发送给 Robot
     if isinstance(robot_action, torch.Tensor):
@@ -1112,25 +1078,6 @@ def control_loop(
     joint_names = list(env.robot.bus.motors.keys())
     neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
 
-    #手动初始化安全助手 (Safety Helper)，这里的Safety Helper还是用了之前safety_processor.py中的代码，只是没有按照管道来用
-    safety_helper = None
-    try:
-        # 获取 URDF 路径 (兼容之前的逻辑)
-        urdf_path = None
-        if hasattr(cfg.env, "teleop") and cfg.env.teleop and hasattr(cfg.env.teleop, "urdf_path"):
-             urdf_path = os.path.abspath(cfg.env.teleop.urdf_path)
-        
-        if MKArmSafetyProcessorStep is not None and urdf_path:
-            logging.info(f"🛡️ [Helper] Safety Processor Initialized manually. (Min Z: 0.22)")
-            # 实例化它，但不放入 pipeline，只作为一个普通对象使用
-            safety_helper = MKArmSafetyProcessorStep(
-                urdf_path=urdf_path, 
-                min_z=0.26  # <--- 在这里设置你的安全高度
-            )
-    except Exception as e:
-        logging.warning(f"⚠️ SafetyProcessor init failed: {e}")
-
-
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
@@ -1143,7 +1090,6 @@ def control_loop(
             action=neutral_action,
             env_processor=env_processor,
             action_processor=action_processor,
-            safety_helper=safety_helper,
         )
 
         # [Anti-Windup Logic] 每次循环后，重置 neutral_action 为当前真实位置
