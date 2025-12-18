@@ -567,16 +567,17 @@ def make_processors(
         ),
     ]
 
-    # [新增] 如果路径存在且类已加载，则添加安全拦截器
-    if MKArmSafetyProcessorStep is not None and urdf_path is not None:
-        action_pipeline_steps.append(
-            MKArmSafetyProcessorStep(
-                urdf_path=urdf_path, 
-                min_z=0.220  # 你的安全高度限制
-            )
-        )
-    else:
-        print("⚠️ Skipping SafetyProcessor: URDF path missing or class not imported.")
+    # 我们不再把 SafetyProcessor 放在 pipeline 里，因为它会错误地处理 Delta 值
+    # # [新增] 如果路径存在且类已加载，则添加安全拦截器
+    # if MKArmSafetyProcessorStep is not None and urdf_path is not None:
+    #     action_pipeline_steps.append(
+    #         MKArmSafetyProcessorStep(
+    #             urdf_path=urdf_path, 
+    #             min_z=0.26  # 你的安全高度限制
+    #         )
+    #     )
+    # else:
+    #     print("⚠️ Skipping SafetyProcessor: URDF path missing or class not imported.")
 
     #
     # # Replace InverseKinematicsProcessor with new kinematic processors
@@ -622,6 +623,7 @@ def step_env_and_process_transition(
     action: torch.Tensor,
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+    safety_helper: Any = None,
 ) -> EnvTransition:
     """
     使用处理器管道执行一步环境交互。
@@ -629,21 +631,22 @@ def step_env_and_process_transition(
     """
     # Create action transition
     transition[TransitionKey.ACTION] = action
-    
+
+    # 1. 执行 Action Pipeline (包含 InterventionProcessor 和 SafetyProcessor)
+    # 这里的 processed_action 可能是 Policy 动作，也可能是被替换后的人类动作
+    #    输入：Policy的原始输出 (Normalized Delta)
+    #    输出：真实的物理增量 (Real Delta, e.g. 0.05 rad)
+    processed_action_transition = action_processor(transition)
+    processed_action = processed_action_transition[TransitionKey.ACTION]
+
+    # Clone 一份出来操作
+    robot_action = processed_action.clone()
+
+    # 获取当前机械臂的物理关节位置 (Current Pos)
     raw_joints = env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     if TransitionKey.OBSERVATION not in transition or not isinstance(transition[TransitionKey.OBSERVATION], dict):
         transition[TransitionKey.OBSERVATION] = {}
     transition[TransitionKey.OBSERVATION].update(raw_joints)
-
-    # 1. 执行 Action Pipeline (包含 InterventionProcessor 和 SafetyProcessor)
-    # 这里的 processed_action 可能是 Policy 动作，也可能是被替换后的人类动作
-    processed_action_transition = action_processor(transition)
-    processed_action = processed_action_transition[TransitionKey.ACTION]
-    print(f"processed_action shape: {processed_action.shape}")
-    # 克隆最终决定执行的动作
-    robot_action = processed_action.clone()
-    print(f"robot_action shape0: {robot_action.shape}")
-    # 获取当前真实位置 (用于滤波初始化和归零)
     joint_names = list(env.robot.bus.motors.keys()) 
     current_pos_list = [raw_joints[f"{name}.pos"] for name in joint_names]
     current_pos_tensor = torch.tensor(current_pos_list, device=robot_action.device, dtype=robot_action.dtype)
@@ -678,16 +681,21 @@ def step_env_and_process_transition(
             env.rl_mode = "ZEROING"
             print("\n🛑 [System] STOPPED: Returning to ZERO... (X pressed)")
 
-    print(f"robot_action shape1: {robot_action.shape}")
-
     # 3. 根据当前模式修正 robot_action
     # [Case 1: 人工介入中]
     # 无论处于什么模式，只要按下了介入键，就听人类的。
     # 关键：在这里同步 Policy 的平滑器记忆，保证松手时 0 跳变。
     if is_intervention:
-        # robot_action 已经是人类动作了 (由 action_processor 处理过)
-        # 我们把当前真实位置 (或者人类动作) 喂给滤波器的记忆
-        # 这样滤波器下一次计算时，"上一次动作" 就是现在这个位置
+        #(我觉得没必要) # 如果有 safety_helper，也可以在这里检查一下手柄的输入是否安全
+        # if safety_helper is not None:
+        #     # 构造检查用的 transition (传入绝对位置)
+        #     check_t = transition.copy()
+        #     check_t[TransitionKey.ACTION] = robot_action
+        #     # 显式调用 Helper
+        #     res = safety_helper(check_t) 
+        #     robot_action = res[TransitionKey.ACTION]
+
+        # 同步 Policy 的平滑器记忆，防止接管结束时飞车
         if robot_action.ndim == 2:
             env.last_policy_action = robot_action[:, :6].clone()
         else:
@@ -728,109 +736,79 @@ def step_env_and_process_transition(
 
     # [Case 4: EXPLORE 模式] Policy 控制 (带滤波和软限位)
     elif env.rl_mode == "EXPLORE":
-        # # 如果没有介入，这里的 robot_action 是 Policy 的原始输出
-        
-        # POLICY_MAX_STEP = 0.04
-        # EMA_ALPHA = 0.2
-        
-        # # 提取数据
-        # arm_target = None
-        # arm_current = None
-        # if robot_action.ndim == 2: 
-        #     arm_target = robot_action[:, :6] 
-        #     arm_current = current_pos_tensor[:6].unsqueeze(0)
-        # elif robot_action.ndim == 1:
-        #     arm_target = robot_action[:6]
-        #     arm_current = current_pos_tensor[:6]
-            
-        # if arm_target is not None:
-        #     # [滤波]
-        #     last_action = env.last_policy_action
-        #     if last_action is None: last_action = arm_current.clone()
-            
-        #     # 维度对齐
-        #     if last_action.ndim != arm_target.ndim:
-        #         if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
-            
-        #     # EMA 公式
-        #     arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
-        #     env.last_policy_action = arm_target_smoothed.detach()
-
-        #     # [软限位] Policy Safe Limits (在 gym_manipulator 顶部定义)
-        #     # 注意：这里的限位是给 Policy 的"活动范围"，可以比 SafetyProcessor 的硬限位更保守
-        #     for i in range(6):
-        #         min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
-        #         if robot_action.ndim == 2:
-        #             arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
-        #         else:
-        #             arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
-
-        #     # [限速]
-        #     delta = arm_target_smoothed - arm_current
-        #     delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
-            
-        #     if robot_action.ndim == 2:
-        #         robot_action[:, :6] = arm_current + delta_clipped
-        #     else:
-        #         robot_action[:6] = arm_current + delta_clipped
-
         # 如果没有介入，这里的 robot_action 是 Policy 的原始输出 (范围 -1 ~ 1)
-        
         # === 修改开始: 改为 Delta Control ===
         
         # 定义 Action Scale: Policy 输出 1.0 代表一步移动多少弧度？
         # 建议设小一点，保证动作细腻。例如 0.05 rad/step
         ACTION_SCALE = 0.05 
+        # 0.04 弧度约等于 2.3度。这意味着每秒最大转速约 35度 (2.3 * 15Hz)
+        MAX_DELTA_PER_STEP = 0.04  
         
         # 提取数据
         policy_output_delta = None
         arm_current = None
         
         if robot_action.ndim == 2: 
-            policy_output_delta = robot_action[:, :6] 
+            policy_output_delta = robot_action[:, :6].clone()
             arm_current = current_pos_tensor[:6].unsqueeze(0)
         elif robot_action.ndim == 1:
-            policy_output_delta = robot_action[:6]
+            policy_output_delta = robot_action[:6].clone()
             arm_current = current_pos_tensor[:6]
             
         if policy_output_delta is not None:
             # 1. 计算目标位置: Target = Current + (Policy_Output * Scale)
             # 这样如果 Policy 输出 0 (未知/犹豫)，机械臂就会停在原地，而不是归零
             delta = policy_output_delta * ACTION_SCALE
+            # 强制限制每一帧的最大移动量（单位：弧度）
+            delta = torch.clamp(delta, -MAX_DELTA_PER_STEP, MAX_DELTA_PER_STEP)
+            target_raw = arm_current + delta
             
-            # 2. [可选] 仍然保留平滑滤波，但作用在 Delta 上可能导致滞后，
-            # 建议直接作用在最终 Target 上，或者在 Delta Control 下暂时去掉 EMA，
-            # 因为 SAC 本身输出就是连续变化的。为了简单，我们先计算出 Target。
-            arm_target = arm_current + delta
+            EMA_ALPHA = 0.15  # 平滑系数 (0.1~0.3)。越小越顺滑，但延迟越高；越大反应越快但越抖。
+            # 如果是刚开始（或刚结束人工介入），初始化记忆为当前位置，防止飞车
+            if env.last_policy_action is None:
+                env.last_policy_action = arm_current.clone()
+            # 确保维度对齐 (处理 batch 维度 [1, 6] vs [6])
+            if env.last_policy_action.ndim != target_raw.ndim:
+                if target_raw.ndim == 2: 
+                    env.last_policy_action = env.last_policy_action.unsqueeze(0)
+                else:
+                    env.last_policy_action = env.last_policy_action.squeeze(0)
+
+            # 执行滤波公式: Smoothed = alpha * New + (1-alpha) * Old
+            # 这样新的目标位置只占 15% 的权重，旧的位置占 85%，强迫电机慢慢动
+            arm_target = EMA_ALPHA * target_raw + (1 - EMA_ALPHA) * env.last_policy_action
             
-            # 手动调用 SafetyProcessor 检查这个 arm_target (绝对值)
-            # 只有当 pipeline 里配置了 safety processor 时才执行
-            safety_step = None
-            for step in action_processor.steps:
-                if isinstance(step, MKArmSafetyProcessorStep):
-                    safety_step = step
-                    break
+            # 更新记忆供下一帧使用
+            #env.last_policy_action = arm_target.detach()            
                     
-            if safety_step is not None:
-                # 创建一个临时的 transition 专门用于检查 Target
-                # 注意：这里我们骗 Processor 说这是 action，实际上给的是绝对位置 target
+            #安全检查 (Safety Check with Helper)
+            if safety_helper is not None:
+                # 构造包含夹爪的 7维 向量用于检查
+                full_action_check = robot_action.clone()
+                if robot_action.ndim == 2:
+                    full_action_check[:, :6] = arm_target # 填入计算好的绝对位置
+                else:
+                    full_action_check[:6] = arm_target    # 填入计算好的绝对位置
+                # 构造临时 Transition
                 check_transition = transition.copy()
-                check_transition[TransitionKey.ACTION] = arm_target  # 关键：传入绝对位置！
-                
-                # 复用 safety_processor 的逻辑
-                # 注意：需要修改 safety_processor 让它支持 return bool 或抛异常，
-                # 或者我们直接观察它是否修改了 action (回滚)
-                
-                # 更简单的做法：直接复用 safety_processor 里的核心检查函数
-                # 但由于它是 ProcessorStep，我们可以直接调用它
-                result_transition = safety_step(check_transition)
-                
-                # 如果 SafetyProcessor 发现违规，它会把 action 替换回 last_safe_action
-                # 我们检查 result_transition['action'] 是否变了，或者是否等于 arm_target
-                safe_action = result_transition[TransitionKey.ACTION]
-                # 使用 ... (Ellipsis) 可以同时处理 1D [7] 和 2D [B, 7] 的情况
-                safe_action_6d = safe_action[..., :6]
-                arm_target = safe_action_6d
+                check_transition[TransitionKey.ACTION] = full_action_check
+                # 🛡️ 显式调用 Helper 进行安检！
+                # Helper 内部只会看到绝对位置，它的 internal state 也是绝对位置。
+                # 如果触发回滚，它回滚的也是绝对位置。完美！
+                result_transition = safety_helper(check_transition)
+                # 获取安检后的动作
+                safe_full_action = result_transition[TransitionKey.ACTION]
+                # 如果安检后的动作和安检前差别很大，说明被 Safety 拦截并回滚了
+                diff = (safe_full_action - full_action_check).abs().max().item()
+                if diff > 1e-4:
+                    print(f"🛡️ [SAFETY BLOCK] Request denied! Diff: {diff:.4f}. Rolling back.")
+
+                # 拆分回 arm_target
+                if robot_action.ndim == 2:
+                    arm_target = safe_full_action[:, :6]
+                else:
+                    arm_target = safe_full_action[:6]
 
             # 3. [软限位] Policy Safe Limits
             # 限制 Target 不要超出安全范围
@@ -841,34 +819,33 @@ def step_env_and_process_transition(
                 else:
                     arm_target[i] = torch.clamp(arm_target[i], min_lim, max_lim)
 
-            # 4. [最终赋值]
-            #检查维度是否匹配，如果不匹配则 squeeze 掉多余的 batch 维度
-            # # 情况 A: robot_action 是 1D [7], 但 arm_target 是 2D [1, 6]
-            # # 解决: 把 arm_target 压扁成 [6]
-            # if robot_action.ndim == 1 and arm_target.ndim == 2:
-            #     arm_target = arm_target.squeeze(0)
-            # # 情况 B: robot_action 是 2D [1, 7], 但 arm_target 是 1D [6]
-            # # 解决: 把 arm_target 升维成 [1, 6]
-            # elif robot_action.ndim == 2 and arm_target.ndim == 1:
-            #     arm_target = arm_target.unsqueeze(0)
+            #所有检查做完后，再更新记忆！✅
+            # 这样记忆里存的永远是合法的、实际发送给机器人的位置
+            env.last_policy_action = arm_target.detach()
 
+            # 4. [最终赋值]
             # 因为我们是基于 Current 算的 Delta，所以不需要再做额外的限速 (ACTION_SCALE 就是限速)
             if robot_action.ndim == 2:
                 robot_action[:, :6] = arm_target
             else:
                 robot_action[:6] = arm_target
 
-            print(f"robot_action shape2: {robot_action.shape}")
             if env.current_step % 5 == 0: # 提高频率观察
-                # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
+                #观察前几个关节运动幅度
                 j0_curr = arm_current.squeeze()[0].item()
                 j0_targ = arm_target.squeeze()[0].item()
+                raw_d0 = policy_output_delta.squeeze()[0].item()
+                print(f"⚠️ [Step {env.current_step}] J0(Base): {j0_curr:.5f} -> {j0_targ:.5f} (Delta_Raw: {raw_d0:.5f})")
+                j1_curr = arm_current.squeeze()[1].item()
+                j1_targ = arm_target.squeeze()[1].item()
+                raw_d1 = policy_output_delta.squeeze()[1].item()
+                print(f"⚠️ [Step {env.current_step}] J1(Base): {j1_curr:.5f} -> {j1_targ:.5f} (Delta_Raw: {raw_d1:.5f})")
+                j2_curr = arm_current.squeeze()[2].item()
+                j2_targ = arm_target.squeeze()[2].item()
+                raw_d2 = policy_output_delta.squeeze()[2].item()
+                print(f"⚠️ [Step {env.current_step}] J2(Base): {j2_curr:.5f} -> {j2_targ:.5f} (Delta_Raw: {raw_d2:.5f})")
                 
-                # 打印格式: [Step] J0_Curr -> J0_Target (Policy_Delta)
-                # 如果 J0 角度很大，且还在往大变，就很危险
-                raw_d = policy_output_delta.squeeze()[0].item()
-                print(f"⚠️ [Step {env.current_step}] J0(Base): {j0_curr:.3f} -> {j0_targ:.3f} (Delta_Raw: {raw_d:.2f})")
-                
+                # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
                 # 检查是否贴近限位边界
                 for i in range(3): # 只检查前3个主要关节
                     min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-99, 99))
@@ -883,7 +860,6 @@ def step_env_and_process_transition(
     if robot_action.ndim > 1:
         robot_action = robot_action.squeeze(0)
 
-    print(f"robot_action shape: {robot_action.shape}")
     # 发送动作
     obs, reward, terminated, truncated, info = env.step(robot_action)
 
@@ -1136,6 +1112,25 @@ def control_loop(
     joint_names = list(env.robot.bus.motors.keys())
     neutral_action = torch.tensor([current_joints[f"{k}.pos"] for k in joint_names], dtype=torch.float32)
 
+    #手动初始化安全助手 (Safety Helper)，这里的Safety Helper还是用了之前safety_processor.py中的代码，只是没有按照管道来用
+    safety_helper = None
+    try:
+        # 获取 URDF 路径 (兼容之前的逻辑)
+        urdf_path = None
+        if hasattr(cfg.env, "teleop") and cfg.env.teleop and hasattr(cfg.env.teleop, "urdf_path"):
+             urdf_path = os.path.abspath(cfg.env.teleop.urdf_path)
+        
+        if MKArmSafetyProcessorStep is not None and urdf_path:
+            logging.info(f"🛡️ [Helper] Safety Processor Initialized manually. (Min Z: 0.22)")
+            # 实例化它，但不放入 pipeline，只作为一个普通对象使用
+            safety_helper = MKArmSafetyProcessorStep(
+                urdf_path=urdf_path, 
+                min_z=0.26  # <--- 在这里设置你的安全高度
+            )
+    except Exception as e:
+        logging.warning(f"⚠️ SafetyProcessor init failed: {e}")
+
+
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
@@ -1148,6 +1143,7 @@ def control_loop(
             action=neutral_action,
             env_processor=env_processor,
             action_processor=action_processor,
+            safety_helper=safety_helper,
         )
 
         # [Anti-Windup Logic] 每次循环后，重置 neutral_action 为当前真实位置

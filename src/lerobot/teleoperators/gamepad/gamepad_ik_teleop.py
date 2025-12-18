@@ -293,5 +293,4 @@ class GamepadIKTeleop(Teleoperator):
             action_array = self.core.step(xyz_delta, manual)
 
 
-        print(f"action_array shape :{action_array.shape}")
         return torch.from_numpy(action_array).float()
