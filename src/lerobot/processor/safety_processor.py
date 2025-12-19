@@ -20,7 +20,7 @@ class MKArmSafetyProcessorStep(ProcessorStep):
     安全逻辑：
     1. 针对 Joint 4 (Wrist) 进行 FK 高度校验 (Z > min_z)。
     2. 如果检测到人工介入 (Teleop)，则**无条件放行**并更新安全状态。
-    3. 如果 Policy 违规，则保持在上一帧的安全位置 (Hold)。
+    3. 如果 Policy 违规，就不执行，等待下一个移动指令。
     """
     urdf_path: str
     min_z: float = 0.30  # Joint 4 (Link 4) 的最小高度，防止腕部撞桌子
@@ -112,23 +112,47 @@ class MKArmSafetyProcessorStep(ProcessorStep):
 
         # 5. 处置逻辑
         if is_unsafe:
-            if self.last_safe_action is not None:
-                # 触发保护：回滚到上一次的安全动作 (Hold Position)
-                # 这比置零更安全，防止机械臂突然掉下来
-                # logger.warning(f"🛡️ Safety Triggered: {reason} -> Holding Position") # 可选：减少日志刷屏
+            logger.warning(f"🛡️ Safety Block: {reason}. Holding Position.")
+            pass
+        # if is_unsafe:
+        #     #尝试自救 ===
+        #     allow_rescue = False
+        #     if self.last_safe_action is not None:
+        #         # 计算上一次动作的高度
+        #         q_prev_pin = np.zeros(model_nq)
+        #         n_copy = min(len(self.last_safe_action), model_nq)
+        #         q_prev_pin[:n_copy] = self.last_safe_action[:n_copy]
+        #         pin.framesForwardKinematics(self.model, self.data, q_prev_pin)
+        #         prev_z = self.data.oMf[self.check_frame_id].translation[2]
                 
-                safe_action_tensor = torch.from_numpy(self.last_safe_action).to(device).type(dtype)
+        #         # 如果新动作的高度 (curr_pos[2]) 比 上一次高度 (prev_z) 更高
+        #         # 说明它正在试图离开地板，允许放行！
+        #         if curr_pos[2] > prev_z:
+        #             allow_rescue = True
+        #             # logger.info(f"🛡️ Safety Rescue: Allowing upward movement ({prev_z:.3f} -> {curr_pos[2]:.3f}) despite being low.")
+
+        #     if allow_rescue:
+        #         # 虽然处于不安全区域，但在往好的方向走，更新记录并放行
+        #         self.last_safe_action = q.copy()
+        #         return transition
+
+        #     if self.last_safe_action is not None:
+        #         # 触发保护：回滚到上一次的安全动作 (Hold Position)
+        #         # 这比置零更安全，防止机械臂突然掉下来
+        #         # logger.warning(f"🛡️ Safety Triggered: {reason} -> Holding Position") # 可选：减少日志刷屏
                 
-                # 恢复 Batch 维度
-                if isinstance(action, torch.Tensor) and action.ndim > 1:
-                     safe_action_tensor = safe_action_tensor.unsqueeze(0)
+        #         safe_action_tensor = torch.from_numpy(self.last_safe_action).to(device).type(dtype)
+                
+        #         # 恢复 Batch 维度
+        #         if isinstance(action, torch.Tensor) and action.ndim > 1:
+        #              safe_action_tensor = safe_action_tensor.unsqueeze(0)
                     
-                transition[TransitionKey.ACTION] = safe_action_tensor
-            else:
-                logger.warning(f"🛡️ Safety Triggered: {reason} -> No history, passing through (Critical!!!)")
-        else:
-            # 记录当前安全动作
-            self.last_safe_action = q.copy()
+        #         transition[TransitionKey.ACTION] = safe_action_tensor
+        #     else:
+        #         logger.warning(f"🛡️ Safety Triggered: {reason} -> No history, passing through (Critical!!!)")
+        # else:
+        #     # 记录当前安全动作
+        #     self.last_safe_action = q.copy()
 
         return transition
 

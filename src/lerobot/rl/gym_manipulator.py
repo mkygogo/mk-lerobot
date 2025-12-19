@@ -106,7 +106,7 @@ POLICY_SAFE_LIMITS = {
     # 关节索引: (最小弧度, 最大弧度)
     0: (-1.0, 1.0), # Base
     1: (0.74, 1.70), # Shoulder (限制不要倒地)
-    2: (-1.0, -0.42), # Elbow
+    2: (-1.0, -0.42), # Elbow  #(-1, -0.42)
     3: (-1.7, 1.2), # Wrist 1
     4: (-0.4, 0.4), # Wrist 2
     5: (-2.0, 2.0), # Wrist 3
@@ -652,14 +652,6 @@ def step_env_and_process_transition(
     # 无论处于什么模式，只要按下了介入键，就听人类的。
     # 关键：在这里同步 Policy 的平滑器记忆，保证松手时 0 跳变。
     if is_intervention:
-        #(我觉得没必要) # 如果有 safety_helper，也可以在这里检查一下手柄的输入是否安全
-        # if safety_helper is not None:
-        #     # 构造检查用的 transition (传入绝对位置)
-        #     check_t = transition.copy()
-        #     check_t[TransitionKey.ACTION] = robot_action
-        #     # 显式调用 Helper
-        #     res = safety_helper(check_t) 
-        #     robot_action = res[TransitionKey.ACTION]
 
         # 同步 Policy 的平滑器记忆，防止接管结束时飞车
         if robot_action.ndim == 2:
@@ -707,9 +699,9 @@ def step_env_and_process_transition(
         
         # 定义 Action Scale: Policy 输出 1.0 代表一步移动多少弧度？
         # 建议设小一点，保证动作细腻。例如 0.05 rad/step
-        ACTION_SCALE = 0.05 
+        ACTION_SCALE = 0.2 
         # 0.04 弧度约等于 2.3度。这意味着每秒最大转速约 35度 (2.3 * 15Hz)
-        MAX_DELTA_PER_STEP = 0.04  
+        MAX_DELTA_PER_STEP = 0.2  
         EMA_ALPHA = 0.15  # 平滑系数 (0.1~0.3)。越小越顺滑，但延迟越高；越大反应越快但越抖。
         # 提取数据
         policy_output_delta = None
@@ -748,6 +740,7 @@ def step_env_and_process_transition(
             #env.last_policy_action = arm_target.detach()            
                     
             #安全检查 (Safety Check with Helper)
+            #safety_helper = None
             if safety_helper is not None:
                 # 构造包含夹爪的 7维 向量用于检查
                 full_action_check = robot_action.clone()
@@ -755,26 +748,22 @@ def step_env_and_process_transition(
                     full_action_check[:, :6] = arm_target # 填入计算好的绝对位置
                 else:
                     full_action_check[:6] = arm_target    # 填入计算好的绝对位置
-                # 构造临时 Transition
-                check_transition = transition.copy()
-                check_transition[TransitionKey.ACTION] = full_action_check
-                # 🛡️ 显式调用 Helper 进行安检！
-                # Helper 内部只会看到绝对位置，它的 internal state 也是绝对位置。
-                # 如果触发回滚，它回滚的也是绝对位置。完美！
-                result_transition = safety_helper(check_transition)
-                # 获取安检后的动作
-                safe_full_action = result_transition[TransitionKey.ACTION]
-                # 如果安检后的动作和安检前差别很大，说明被 Safety 拦截并回滚了
-                diff = (safe_full_action - full_action_check).abs().max().item()
-                print(f"checking safety: {diff}")
-                if diff > 1e-4:
-                    print(f"🛡️ [SAFETY BLOCK] Request denied! Diff: {diff:.4f}. Rolling back.")
 
-                # 拆分回 arm_target
-                if robot_action.ndim == 2:
-                    arm_target = safe_full_action[:, :6]
-                else:
-                    arm_target = safe_full_action[:6]
+                #直接调用新接口，不再需要包装成 transition 字典
+                safe_full_action, is_modified = safety_helper.check_and_correct(
+                    full_action_check, 
+                    current_q_tensor=current_pos_tensor # 传入当前位置很重要！
+                )
+                
+                if is_modified:
+                    #print("Policy输出action不安全，safety_helper做了修改")
+                    # 如果超出安全边界被修改了，就把安全动作写回 arm_target
+                    if robot_action.ndim == 2:
+                        arm_target = safe_full_action[:, :6]
+                    else:
+                        arm_target = safe_full_action[:6]    
+            else :
+                print("safety_helper not work!!!")
 
             # 3. [软限位] Policy Safe Limits
             # 限制 Target 不要超出安全范围
@@ -797,19 +786,25 @@ def step_env_and_process_transition(
                 robot_action[:6] = arm_target
 
             if env.current_step % 5 == 0: # 提高频率观察
-                #观察前几个关节运动幅度
-                j0_curr = arm_current.squeeze()[0].item()
-                j0_targ = arm_target.squeeze()[0].item()
-                raw_d0 = policy_output_delta.squeeze()[0].item()
-                print(f"⚠️ [Step {env.current_step}] J0(Base): {j0_curr:.5f} -> {j0_targ:.5f} (Delta_Raw: {raw_d0:.5f})")
-                j1_curr = arm_current.squeeze()[1].item()
-                j1_targ = arm_target.squeeze()[1].item()
-                raw_d1 = policy_output_delta.squeeze()[1].item()
-                print(f"⚠️ [Step {env.current_step}] J1(Base): {j1_curr:.5f} -> {j1_targ:.5f} (Delta_Raw: {raw_d1:.5f})")
-                j2_curr = arm_current.squeeze()[2].item()
-                j2_targ = arm_target.squeeze()[2].item()
-                raw_d2 = policy_output_delta.squeeze()[2].item()
-                print(f"⚠️ [Step {env.current_step}] J2(Base): {j2_curr:.5f} -> {j2_targ:.5f} (Delta_Raw: {raw_d2:.5f})")
+                print(f"\n🔍 [Step {env.current_step}] Action Analysis:")
+                names = ["Base", "Shoulder", "Elbow"]
+                for i in range(3): # 只看前三个关键关节
+                    curr = arm_current.squeeze()[i].item()
+                    raw_act = policy_output_delta.squeeze()[i].item() # Policy 原始输出 (-1 ~ 1)
+                    
+                    # 重算一遍不带限位的理想目标，用于对比
+                    ideal_target = curr + (raw_act * ACTION_SCALE) 
+                    final_target = arm_target.squeeze()[i].item() # 经过限位后的最终目标
+                    
+                    # 判断是否被限位被“切”了
+                    is_clamped = abs(final_target - ideal_target) > 1e-3
+                    status = "🔴 CLAMPED" if is_clamped else "✅ OK"
+                    
+                    print(f"  Joint {i} ({names[i]}):")
+                    print(f"    Raw Policy: {raw_act:+.4f} (Intent)")
+                    print(f"    Current:    {curr:+.4f}")
+                    print(f"    Ideal Tgt:  {ideal_target:+.4f} (Curr + Raw*Scale)")
+                    print(f"    Final Tgt:  {final_target:+.4f} (Sent to Robot) -> {status}")
                 
                 # 获取前3轴的数据 (通常撞相机的是 Base, Shoulder 或 Elbow)
                 # 检查是否贴近限位边界
@@ -818,6 +813,7 @@ def step_env_and_process_transition(
                 #     curr_val = arm_current.squeeze()[i].item()
                 #     if curr_val < min_lim + 0.05 or curr_val > max_lim - 0.05:
                 #         print(f"  🚨 DANGER ZONE: Joint {i} at {curr_val:.3f} is near limit {min_lim}~{max_lim}!")
+    
     # -------------------------------------------------------------------------
     # 格式转换回 Numpy 发送给 Robot
     if isinstance(robot_action, torch.Tensor):
@@ -858,147 +854,6 @@ def step_env_and_process_transition(
     new_transition = env_processor(new_transition)
 
     return new_transition
-
-# def step_env_and_process_transition(
-#     env: gym.Env,
-#     transition: EnvTransition,
-#     action: torch.Tensor,
-#     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
-#     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
-# ) -> EnvTransition:
-#     """
-#     使用处理器管道执行一步环境交互。
-#     """
-#     # Create action transition
-#     transition[TransitionKey.ACTION] = action
-    
-#     raw_joints = env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
-#     if TransitionKey.OBSERVATION not in transition or not isinstance(transition[TransitionKey.OBSERVATION], dict):
-#         transition[TransitionKey.OBSERVATION] = {}
-#     transition[TransitionKey.OBSERVATION].update(raw_joints)
-
-#     processed_action_transition = action_processor(transition)
-#     processed_action = processed_action_transition[TransitionKey.ACTION]
-
-#     # 使用 clone() 创建副本，避免直接修改 Buffer 中存储的原始 Policy 动作
-#     robot_action = processed_action.clone()
-    
-#     # =================================================================
-#     # 🛡️ 三重安全逻辑: 滤波(Smoothing) + 限位(Safe Zone) + 限速(Speed Limit)
-#     # =================================================================
-    
-#     # 1. 检查是否有人工介入
-#     is_intervention = False
-#     if TransitionKey.INFO in processed_action_transition:
-#         info = processed_action_transition[TransitionKey.INFO]
-#         is_rb_pressed = info.get(TeleopEvents.IS_INTERVENTION, False)
-#         is_success_pressed = info.get(TeleopEvents.SUCCESS, False)
-#         is_failure_pressed = info.get(TeleopEvents.FAILURE, False)
-#         is_rerecord_pressed = info.get(TeleopEvents.RERECORD_EPISODE, False)
-        
-#         if is_success_pressed: print("💡 User Signal: SUCCESS (Y)")
-#         if is_rerecord_pressed: print("💡 User Signal: RERECORD/RESET (X)")
-            
-#         is_intervention = is_rb_pressed or is_success_pressed or is_failure_pressed or is_rerecord_pressed
-    
-#     # 如果介入了，清空 Policy 平滑器的记忆，避免下次接管时跳变
-#     if is_intervention:
-#         env.last_policy_action = None
-
-#     # 2. 如果是 Policy 控制 (非介入状态)，执行平滑和限制
-#     if not is_intervention and isinstance(robot_action, torch.Tensor):
-#         POLICY_MAX_STEP = 0.04  # 速度上限
-#         EMA_ALPHA = 0.2         # 平滑系数 (0.1~1.0)，越小越顺滑但延迟越高
-        
-#         joint_names = list(env.robot.bus.motors.keys()) 
-#         current_pos_list = [raw_joints[f"{name}.pos"] for name in joint_names]
-        
-#         current_pos_tensor = torch.tensor(
-#             current_pos_list, 
-#             device=robot_action.device, 
-#             dtype=robot_action.dtype
-#         )
-        
-#         # [A] 提取关节目标 & 增加 Batch 维度
-#         arm_target = None
-#         arm_current = None
-        
-#         if robot_action.ndim == 2: # [Batch, 7]
-#             arm_target = robot_action[:, :6] 
-#             arm_current = current_pos_tensor[:6].unsqueeze(0)
-#         elif robot_action.ndim == 1: # [7]
-#             arm_target = robot_action[:6]
-#             arm_current = current_pos_tensor[:6]
-            
-#         if arm_target is not None:
-#             # [B] EMA 平滑滤波 (Anti-Jitter)
-#             # ----------------------------------------------------
-#             last_action = env.last_policy_action
-            
-#             # 如果没有历史记录（刚开始或刚结束介入），用当前真实位置初始化
-#             # 这样保证从静止开始启动，不会突变
-#             if last_action is None:
-#                 last_action = arm_current.clone()
-            
-#             # 确保维度匹配 (处理 Batch 广播)
-#             if last_action.ndim != arm_target.ndim:
-#                 if arm_target.ndim == 2: last_action = last_action.unsqueeze(0)
-                
-#             # 执行滤波公式: Smoothed = alpha * New + (1-alpha) * Old
-#             arm_target_smoothed = EMA_ALPHA * arm_target + (1 - EMA_ALPHA) * last_action
-            
-#             # 更新记忆
-#             env.last_policy_action = arm_target_smoothed.detach() # detach防止梯度累积
-#             # ----------------------------------------------------
-
-#             # [C] Policy 安全屋 (使用平滑后的目标)
-#             for i in range(6):
-#                 min_lim, max_lim = POLICY_SAFE_LIMITS.get(i, (-3.14, 3.14))
-#                 if robot_action.ndim == 2:
-#                     arm_target_smoothed[:, i] = torch.clamp(arm_target_smoothed[:, i], min_lim, max_lim)
-#                 else:
-#                     arm_target_smoothed[i] = torch.clamp(arm_target_smoothed[i], min_lim, max_lim)
-
-#             # [D] 速度限制 (基于平滑后的目标计算 Delta)
-#             delta = arm_target_smoothed - arm_current
-#             delta_clipped = torch.clamp(delta, -POLICY_MAX_STEP, POLICY_MAX_STEP)
-            
-#             # [E] 写回 robot_action
-#             if robot_action.ndim == 2:
-#                 robot_action[:, :6] = arm_current + delta_clipped
-#             else:
-#                 robot_action[:6] = arm_current + delta_clipped
-
-#     # =================================================================
-
-#     if isinstance(robot_action, torch.Tensor):
-#         robot_action = robot_action.cpu().numpy()
-    
-#     if robot_action.ndim > 1:
-#         robot_action = robot_action.squeeze(0)
-
-#     obs, reward, terminated, truncated, info = env.step(robot_action)
-
-#     reward = reward + processed_action_transition[TransitionKey.REWARD]
-#     terminated = terminated or processed_action_transition[TransitionKey.DONE]
-#     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
-#     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
-#     new_info = processed_action_transition[TransitionKey.INFO].copy()
-#     new_info.update(info)
-
-#     new_transition = create_transition(
-#         observation=obs,
-#         action=processed_action,
-#         reward=reward,
-#         done=terminated,
-#         truncated=truncated,
-#         info=new_info,
-#         complementary_data=complementary_data,
-#     )
-    
-#     new_transition = env_processor(new_transition)
-
-#     return new_transition
 
 
 

@@ -98,11 +98,11 @@ from .gym_manipulator import (
 )
 
 try:
-    from lerobot.processor.safety_processor import MKArmSafetyProcessorStep
-    print("✅ [Actor] MKArmSafetyProcessorStep imported successfully.")
+    from .safety_helper import MKArmSafetyHelper
+    print("✅ [Actor] MKArmSafetyHelper imported successfully.")
 except ImportError:
-    MKArmSafetyProcessorStep = None
-    print("⚠️ [Actor] MKArmSafetyProcessorStep NOT found.")
+    MKArmSafetyHelper = None
+    print("⚠️ [Actor] MKArmSafetyHelper NOT found.")
 
 # Main entry point
 
@@ -290,17 +290,17 @@ def act_with_policy(
         if hasattr(cfg.env, "teleop") and cfg.env.teleop and hasattr(cfg.env.teleop, "urdf_path"):
             urdf_path = os.path.abspath(cfg.env.teleop.urdf_path)
         
-        print(f"🛡️ [Actor DEBUG] Try init Safety. Class: {MKArmSafetyProcessorStep}, Path: {urdf_path}")
+        print(f"🛡️ [Actor DEBUG] Try init Safety. Class: {MKArmSafetyHelper}, Path: {urdf_path}")
 
-        if MKArmSafetyProcessorStep is not None and urdf_path:
-            safety_helper = MKArmSafetyProcessorStep(
+        if MKArmSafetyHelper is not None and urdf_path:
+            safety_helper = MKArmSafetyHelper(
                 urdf_path=urdf_path, 
                 min_z=0.26 # <--- 您的安全高度
             )
             logging.info(f"✅ [Actor] Safety Helper initialized!")
     except Exception as e:
         logging.warning(f"⚠️ [Actor] Safety init failed: {e}")
-        
+
     # Process initial observation
     transition = create_transition(observation=obs, info=info)
     transition = env_processor(transition)
@@ -359,12 +359,15 @@ def act_with_policy(
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
         #print(f"🧐 DEBUG: Classifier says high prob, but Actor received reward: {reward}", flush=True)
-        # 强制成功判定：如果奖励大于 0.7，视为成功并结束
+        success_threshold = 0.7 # 默认值
+        if cfg.env.processor.reward_classifier is not None:
+            success_threshold = cfg.env.processor.reward_classifier.success_threshold
         # 即使环境还没判 done，我们也强制 done，防止机器人一直抓着不放
         current_reward_val = float(reward)
         #print(f"🧐 DEBUG: Classifier={current_reward_val:.4f} | ActorReceived={float(reward):.4f}", flush=True)
-        if current_reward_val >= 0.7 and not done:
-            logging.info(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= 0.7)! Force resetting.")
+        if current_reward_val >= success_threshold and not done:
+            logging.info(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= {success_threshold})! Force resetting.")
+            print(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= {success_threshold})! Force resetting.")
             done = True
             # 更新 transition 里的 done 状态，确保 Learner 也知道这结束了
             new_transition[TransitionKey.DONE] = torch.tensor([True], device=reward.device if isinstance(reward, torch.Tensor) else "cpu")
