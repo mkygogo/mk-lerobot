@@ -369,6 +369,14 @@ def act_with_policy(
             logging.info(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= {success_threshold})! Force resetting.")
             print(f"🎉 Success detected by Actor (Reward: {current_reward_val:.4f} >= {success_threshold})! Force resetting.")
             done = True
+            SUCCESS_BONUS = 100.0
+            #核心：直接修改要发送给 Learner 的 Transition 数据
+            #    注意：new_transition[TransitionKey.REWARD] 通常是一个 Tensor，支持直接相加
+            new_transition[TransitionKey.REWARD] += SUCCESS_BONUS
+            #同步更新本地 reward 变量，确保下面的 sum_reward_episode 统计正确
+            #    因为 reward 之前是指向旧值的引用，我们更新它指向新值
+            reward = new_transition[TransitionKey.REWARD]
+            print(f"💰 Bonus applied! Reward boosted to: {float(reward):.2f}")
             # 更新 transition 里的 done 状态，确保 Learner 也知道这结束了
             new_transition[TransitionKey.DONE] = torch.tensor([True], device=reward.device if isinstance(reward, torch.Tensor) else "cpu")
 
