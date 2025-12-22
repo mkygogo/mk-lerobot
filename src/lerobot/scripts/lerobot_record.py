@@ -111,6 +111,7 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     so100_leader,
     so101_leader,
+    gamepad,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -298,6 +299,17 @@ def record_loop(
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+        #新增：检查手柄事件 ---
+        if teleop is not None and not isinstance(teleop, list):
+            teleop_events = teleop.get_teleop_events()
+            # 如果手柄发出了 SUCCESS (Y键) 信号，提前结束录制并保存
+            if teleop_events.get("success", False):
+                logging.info("💾 Received SUCCESS signal from teleop. Saving episode early.")
+                break
+            # 如果手柄发出了 TERMINATE (B键) 信号，彻底退出
+            if teleop_events.get("terminate_episode", False):
+                events["stop_recording"] = True
+                break
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -328,7 +340,11 @@ def record_loop(
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
-            act = teleop.get_action()
+            #为了兼容gamepad ik
+            try:
+                act = teleop.get_action(observation=obs)
+            except TypeError:
+                act = teleop.get_action()
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
@@ -460,6 +476,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                #新增：等待手柄按下 Y 键才开始录制 ---
+                logging.info(f"等待按下 【A键】 开始录制第 {recorded_episodes} 回合...")
+                while not events["stop_recording"]:
+                    t_events = teleop.get_teleop_events() if teleop else {}
+                    if t_events.get("start_recording", False): # 收到 A 键
+                        logging.info("🎬 A键按下，录制开始！")
+                        break 
+                    if t_events.get("terminate_episode", False): # 收到 B 键
+                        events["stop_recording"] = True
+                        break
+                    time.sleep(0.05)
+                
+                if events["stop_recording"]: 
+                    break
+
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,

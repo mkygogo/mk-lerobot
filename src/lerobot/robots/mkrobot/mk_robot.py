@@ -219,10 +219,15 @@ class MKRobot(Robot):
         if not self.is_connected: return action
 
         # 1. 格式转换
-        if isinstance(action, torch.Tensor):
-            q_sim_target = action.cpu().numpy()
+        if isinstance(action, dict) and "action" in action:
+            q_sim_target_data = action["action"]
         else:
-            q_sim_target = action
+            q_sim_target_data = action
+
+        if isinstance(q_sim_target_data, torch.Tensor):
+            q_sim_target = q_sim_target_data.cpu().numpy()
+        else:
+            q_sim_target = q_sim_target_data
 
         # 2. 映射到 Real 坐标系
         q_real_target = q_sim_target[:6] * HARDWARE_DIR

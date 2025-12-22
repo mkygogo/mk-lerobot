@@ -86,6 +86,11 @@ class GamepadIKTeleop(Teleoperator):
         #启动同步标志位
         # 只要这个是 False，说明还没有根据真机状态初始化过
         self.has_synced_startup = False
+        # 添加长按计数器 #这里是后来做openpi采集数据加的，之前这块hilserl是在自己的record的python里实现的
+        self.home_button_timer = 0 
+        self.home_press_threshold = 30
+
+        self._btn_last_states = {}
 
     def _init_pygame(self):
         pygame.init()
@@ -103,6 +108,24 @@ class GamepadIKTeleop(Teleoperator):
         xyz_delta = np.zeros(3)
         manual = {'j4':0, 'j5':0, 'j6':0, 'gripper':0}
         
+        #介入状态 (RB 按住)
+        is_intervention = (self.joystick.get_button(self.BTN_RB) == 1)
+
+        #A 键 (SUCCESS: 完成当前回合并开启下一回合)
+        is_success_signal = (self.joystick.get_button(self.BTN_Y) == 1)
+
+        #B 键 (TERMINATE: 结束本次采集任务并保存退出)
+        is_terminate_signal = (self.joystick.get_button(self.BTN_B) == 1)
+
+        # X 键长按归零逻辑 (X键索引通常为 2)
+        if self.joystick.get_button(2):
+            self.home_button_timer += 1
+            if self.home_button_timer == self.home_press_threshold:
+                self.core.start_homing()
+                logger.info("🏠 Homing triggered: Long press X detected.")
+        else:
+            self.home_button_timer = 0
+
         if not self.joystick: 
             return xyz_delta, manual
 
@@ -191,14 +214,26 @@ class GamepadIKTeleop(Teleoperator):
                 TeleopEvents.IS_INTERVENTION: False,
                 TeleopEvents.SUCCESS: False,
                 TeleopEvents.RERECORD_EPISODE: False,
+                TeleopEvents.TERMINATE_EPISODE: False,
             }
+
+        # 边沿检测：确保按一下只发一次信号
+        def is_newly_pressed(btn_id, name):
+            if not hasattr(self, '_btn_last_states'): 
+                self._btn_last_states = {}
+            curr_state = self.joystick.get_button(btn_id) == 1
+            last_state = self._btn_last_states.get(name, False)
+            self._btn_last_states[name] = curr_state
+            return curr_state and not last_state
 
         # 1. 介入状态 (RB 按住) - 驱动层的"离合器"
         is_intervention = (self.joystick.get_button(self.BTN_RB) == 1)
         self.is_active = is_intervention 
+        is_start_signal = is_newly_pressed(self.BTN_A, "start")   # A 键 (ID 0) -> 开始录制
+        is_success_signal = is_newly_pressed(self.BTN_Y, "success") # Y 键 (ID 3) -> 完成并保存
+        is_terminate_signal = is_newly_pressed(self.BTN_B, "exit")  # B 键 (ID 1) -> 退出脚本
 
-        # 2. A 键 (映射为 SUCCESS 事件，代表 "Start/Confirm")
-        is_start_signal = (self.joystick.get_button(self.BTN_A) == 1)
+        #print(f"is_start_signal:{is_start_signal} is_success_signal:{is_success_signal}, is_terminate_signal:{is_terminate_signal}")
 
         # 3. X 键长按检测 (映射为 RERECORD_EPISODE 事件，代表 "Reset/Stop")
         is_reset_signal = False
@@ -212,9 +247,10 @@ class GamepadIKTeleop(Teleoperator):
 
         return {
             TeleopEvents.IS_INTERVENTION: is_intervention,
-            TeleopEvents.SUCCESS: is_start_signal,          # A 键 -> 绿灯/开始
+            TeleopEvents.SUCCESS: is_success_signal,          # Y 键 -> 绿灯/开始
             TeleopEvents.RERECORD_EPISODE: is_reset_signal, # X 键(长按) -> 红灯/重置
-            TeleopEvents.TERMINATE_EPISODE: False,
+            TeleopEvents.TERMINATE_EPISODE: is_terminate_signal,
+            "start_recording": is_start_signal,
             TeleopEvents.FAILURE: False
         }
 
@@ -245,7 +281,7 @@ class GamepadIKTeleop(Teleoperator):
                 # 返回对应长度的动作 (防止越界)
                 n_joints = 7 # 假设7轴
                 action_out = current_state[:n_joints] if len(current_state) >= n_joints else current_state
-                return torch.from_numpy(action_out).float()
+                return {"action": torch.from_numpy(action_out).float()}
 
         # ========================================================
         # 3. 状态监测与安全锁处理 (Deadman Switch & Safety Lock)
@@ -269,7 +305,7 @@ class GamepadIKTeleop(Teleoperator):
             if not self.core.is_homing:
                 self.rb_safety_lock = True
                 logger.info("🔒 Safety Lock Engaged (Homing Complete)")
-            return torch.from_numpy(action_array).float()
+            return {"action": torch.from_numpy(action_array).float()}
 
         # ========================================================
         # 6. 常规控制模式 (HIL-SERL)
@@ -292,5 +328,4 @@ class GamepadIKTeleop(Teleoperator):
             # --- 纯仿真模式 ---
             action_array = self.core.step(xyz_delta, manual)
 
-
-        return torch.from_numpy(action_array).float()
+        return {"action": torch.from_numpy(action_array).float()}
