@@ -190,15 +190,22 @@ class MKRobot(Robot):
     @property
     def observation_features(self):
         """定义观测空间的数据结构"""
-        return {
+        features = {
             "observation.state": {
                 "dtype": "float32",
                 "shape": (7,),
                 "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
             },
-            # 如果你也返回速度，可以在这里加上
-            # "observation.velocity": { ... }
         }
+
+        # 【关键修改】：动态添加相机特征
+        for cam_name in self.cameras:
+            features[f"observation.images.{cam_name}"] = {
+                "dtype": "video",
+                "shape": (3, self.cameras[cam_name].config.height, self.cameras[cam_name].config.width),
+                "names": ["channels", "height", "width"],
+            }
+        return features
 
     def capture_images(self) -> Dict[str, Any]:
         """读取所有已连接摄像头的图像"""
