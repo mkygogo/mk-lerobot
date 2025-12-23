@@ -506,7 +506,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if events["stop_recording"]: 
                     break
 
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                log_say(f"Recording episode {recorded_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -523,13 +523,32 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                 )
+                #先检查是否需要重录，否则立即保存
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
+
+                # 立即保存当前回合
+                dataset.save_episode()
+                recorded_episodes += 1
+                log_say(f"✅ 第 {recorded_episodes} 回合已保存。")
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    (recorded_episodes < cfg.dataset.num_episodes)
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
+
+                    # 触发电控归零
+                    if hasattr(teleop, "start_homing"):
+                        teleop.start_homing()
+
+                    log_say("🏠 正在自动归零，请稍后...", cfg.play_sounds)
+
                     record_loop(
                         robot=robot,
                         events=events,
@@ -539,54 +558,27 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
                         control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
-
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
-
-                dataset.save_episode()
-                recorded_episodes += 1
-                log_say(f"✅ 第 {recorded_episodes} 回合已保存。")
-
-                #如果是因为 SUCCESS (Y键) 结束的，触发归零 ---
-                # 我们需要在 record_loop 外部感知是因为什么结束的
-                # 或者直接在 Reset 阶段强制先执行一次归零
-                if not events["stop_recording"]:
-                    log_say("Reset and Homing", cfg.play_sounds)
-                    # 关键动作：手动触发电控层的归零模式
-                    if hasattr(teleop, "start_homing"):
-                        teleop.start_homing()
-
-                    log_say("🏠 正在自动归零，请稍后...")
-                    # 执行重置循环：由于 teleop 处于 is_homing 状态，
-                    # 这里的 record_loop 会执行归零动作，直到归零完成自动退出
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s, # 这是一个最大保护上限
-                        dataset=None,
+                        dataset=None, # 不记录
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
 
     finally:
         # 如果是按 B 键退出的，且机械臂还在外面，执行最后一次归零
-        if not events["stop_recording"] == False: # 说明触发了 stop
+        if events["stop_recording"] : # 说明触发了 stop
              if hasattr(teleop, "start_homing"):
                 teleop.start_homing()
-                # 简单运行几秒归零动作
-                # (可选：调用一个精简版的 record_loop)
+                # 强制运行 3-5 秒的简易循环，让机械臂有时间回到零位
+                exit_homing_start = time.perf_counter()
+                while time.perf_counter() - exit_homing_start < 5.0:
+                    obs = robot.get_observation()
+                    # 只要 teleop.is_homing 还在运行，就持续发送动作
+                    if hasattr(teleop, "is_homing") and not teleop.is_homing:
+                        break
+                    act = teleop.get_action(observation=obs)
+                    robot.send_action(act)
+                    time.sleep(1/cfg.dataset.fps)
+                log_say("✅ Safe position reached.", cfg.play_sounds)
 
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
