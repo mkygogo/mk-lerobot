@@ -207,6 +207,17 @@ class GamepadIKTeleop(Teleoperator):
     def send_feedback(self, feedback): 
         pass
 
+    def start_homing(self):
+        """外部调用接口：启动归零程序"""
+        if self.core:
+            self.core.start_homing()
+            logger.info("🏠 External Homing Command Received.")
+
+    @property
+    def is_homing(self) -> bool:
+        """外部查询接口：当前是否正在归零"""
+        return self.core.is_homing
+
     def get_teleop_events(self) -> Dict[str, Any]:
         pygame.event.pump()
         if not self.joystick:
@@ -246,12 +257,12 @@ class GamepadIKTeleop(Teleoperator):
             self.x_press_start_time = None
 
         return {
-            TeleopEvents.IS_INTERVENTION: is_intervention,
-            TeleopEvents.SUCCESS: is_success_signal,          # Y 键 -> 绿灯/开始
-            TeleopEvents.RERECORD_EPISODE: is_reset_signal, # X 键(长按) -> 红灯/重置
-            TeleopEvents.TERMINATE_EPISODE: is_terminate_signal,
-            "start_recording": is_start_signal,
-            TeleopEvents.FAILURE: False
+            TeleopEvents.IS_INTERVENTION.value: is_intervention,     # "is_intervention"
+            TeleopEvents.SUCCESS.value: is_success_signal,           # "success"
+            TeleopEvents.RERECORD_EPISODE.value: is_reset_signal,    # "rerecord_episode"
+            TeleopEvents.TERMINATE_EPISODE.value: is_terminate_signal, # "terminate_episode"
+            TeleopEvents.START_RECORDING.value: is_start_signal,                
+            TeleopEvents.FAILURE.value: False
         }
 
     def get_action(self, observation: dict) -> torch.Tensor:
