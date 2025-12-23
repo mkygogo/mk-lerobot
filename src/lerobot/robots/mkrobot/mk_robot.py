@@ -185,13 +185,13 @@ class MKRobot(Robot):
                 "shape": (7,),
                 "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
             }
-        }
+            }
 
     @property
     def observation_features(self):
         """定义观测空间的数据结构"""
         features = {
-            "observation.state": {
+            "state": {
                 "dtype": "float32",
                 "shape": (7,),
                 "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
@@ -200,7 +200,7 @@ class MKRobot(Robot):
 
         # 【关键修改】：动态添加相机特征
         for cam_name in self.cameras:
-            features[f"observation.images.{cam_name}"] = {
+            features[f"images.{cam_name}"] = {
                 "dtype": "video",
                 "shape": (3, self.cameras[cam_name].config.height, self.cameras[cam_name].config.width),
                 "names": ["channels", "height", "width"],
@@ -286,112 +286,33 @@ class MKRobot(Robot):
         
         return action
 
-    # # =========================================================
-    # # 🕹️ 核心收发逻辑
-    # # =========================================================
-
-    # def send_action(self, action: torch.Tensor) -> torch.Tensor:
-    #     """
-    #     接收 Sim 坐标系动作 (URDF) -> 转换为 Real 动作 -> 发送
-    #     """
-    #     if not self.is_connected: return action
-
-    #     # 1. 转换格式 (Tensor -> Numpy)
-    #     if isinstance(action, torch.Tensor):
-    #         q_sim = action.cpu().numpy()
-    #     else:
-    #         q_sim = action
-
-    #     # 2. 关节角度映射 (Sim -> Real)
-    #     # 前6轴乘系数
-    #     q_real_target = q_sim[:6] * HARDWARE_DIR
-        
-    #     # 3. 夹爪映射 (Sim -> Real)
-    #     # 假设 Teleop 输出的是归一化 0.0(Open)~1.0(Close)
-    #     # 如果你的真机是 1.0=Close, 0.0=Open，则直接用
-    #     g_real = np.clip(q_sim[6], 0.0, 1.0)
-
-    #     # --- 🛡️ 安全限速核心代码 START ---
-    #     # 读取当前真实的电机位置
-    #     current_obs = self.robot.get_observation()
-    #     q_real_current = np.zeros(6)
-    #     for i in range(6):
-    #         q_real_current[i] = current_obs.get(f'joint_{i+1}.pos', 0)
-
-    #     # 计算这一帧想移动的量 (Target - Current)
-    #     delta = q_real_target - q_real_current
-        
-    #     # 强制截断：每帧最大只能移动 config.max_step_rad (默认0.05)
-    #     # 这样即使策略输出 3.14，也只会移动 0.05，变成平滑的运动
-    #     max_step = self.config.max_step_rad
-    #     delta_clipped = np.clip(delta, -max_step, max_step)
-        
-    #     # 计算出实际发送给电机的安全目标
-    #     q_real_safe = q_real_current + delta_clipped
-        
-    #     # 更新 gripper (夹爪通常不需要平滑，或者可以给大一点的阈值)
-    #     # 这里直接通过
-    #     # --- 🛡️ 安全限速核心代码 END ---
-
-
-    #     # 4. 组装字典发送
-    #     command = {
-    #         "joint_1.pos": q_real_safe[0],
-    #         "joint_2.pos": q_real_safe[1],
-    #         "joint_3.pos": q_real_safe[2],
-    #         "joint_4.pos": q_real_safe[3],
-    #         "joint_5.pos": q_real_safe[4],
-    #         "joint_6.pos": q_real_safe[5],
-    #         "gripper.pos": g_real
-    #     }
-    #     self.robot.send_action(command)
-        
-    #     return action
-
     def get_observation(self) -> Dict[str, Any]:
-        """
-        读取 Real 状态 -> 转换为 Sim 坐标系 (URDF) -> 返回
-        """
+        """返回的数据键名必须与上面 observation_features 的 Key 完全一致"""
         if not self.is_connected:
-            # 返回空或零值，防止崩溃
-            return {"observation.state": torch.zeros(7)}
+            return {"state": torch.zeros(7)}
 
         raw_obs = self.robot.get_observation()
         
-        # 1. 解析并转换关节 (Real -> Sim)
+        # 1. 处理关节数据
         q_sim = np.zeros(7)
-        q_sim[0] = raw_obs.get('joint_1.pos', 0) * HARDWARE_DIR[0]
-        q_sim[1] = raw_obs.get('joint_2.pos', 0) * HARDWARE_DIR[1]
-        q_sim[2] = raw_obs.get('joint_3.pos', 0) * HARDWARE_DIR[2]
-        q_sim[3] = raw_obs.get('joint_4.pos', 0) * HARDWARE_DIR[3]
-        q_sim[4] = raw_obs.get('joint_5.pos', 0) * HARDWARE_DIR[4]
-        q_sim[5] = raw_obs.get('joint_6.pos', 0) * HARDWARE_DIR[5]
-
-        # 2. 解析并转换夹爪 (Real -> Sim)
-        # 假设真机返回 0.0~1.0
-        g_real = raw_obs.get('gripper.pos', 0)
-        q_sim[6] = g_real
+        for i in range(6):
+            q_sim[i] = raw_obs.get(f'joint_{i+1}.pos', 0) * HARDWARE_DIR[i]
+        q_sim[6] = raw_obs.get('gripper.pos', 0)
         
-        images = self.capture_images()
+        # 2. 捕获图像
+        images = self.capture_images() 
 
-        # 必须包含: 
-        #   - 独立的 joint_x.pos (供 GymEnv 读取)
-        #   - 图像 (供 GymEnv 读取)
-        #   - observation.state (供 Policy 使用)
-        
+        # 3. 组装字典
         obs_dict = {
-            "observation.state": torch.from_numpy(q_sim).float(),
-            # 显式填入 GymEnv 需要的键名
-            "joint_1.pos": q_sim[0],
-            "joint_2.pos": q_sim[1],
-            "joint_3.pos": q_sim[2],
-            "joint_4.pos": q_sim[3],
-            "joint_5.pos": q_sim[4],
-            "joint_6.pos": q_sim[5],
+            "state": torch.from_numpy(q_sim).float(),
+            # 兼容底层 Gym 环境需要的原始轴名
+            "joint_1.pos": q_sim[0], "joint_2.pos": q_sim[1], "joint_3.pos": q_sim[2],
+            "joint_4.pos": q_sim[3], "joint_5.pos": q_sim[4], "joint_6.pos": q_sim[5],
             "gripper.pos": q_sim[6],
         }
 
-        # 合并图像数据到字典中
-        obs_dict.update(images)
+        # 4. 组装图像
+        for cam_name, img in images.items():
+            obs_dict[f"images.{cam_name}"] = img
 
         return obs_dict
