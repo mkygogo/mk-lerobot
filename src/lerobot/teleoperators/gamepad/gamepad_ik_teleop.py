@@ -257,12 +257,12 @@ class GamepadIKTeleop(Teleoperator):
             self.x_press_start_time = None
 
         return {
-            TeleopEvents.IS_INTERVENTION.value: is_intervention,     # "is_intervention"
-            TeleopEvents.SUCCESS.value: is_success_signal,           # "success"
-            TeleopEvents.RERECORD_EPISODE.value: is_reset_signal,    # "rerecord_episode"
-            TeleopEvents.TERMINATE_EPISODE.value: is_terminate_signal, # "terminate_episode"
-            TeleopEvents.START_RECORDING.value: is_start_signal,                
-            TeleopEvents.FAILURE.value: False
+            TeleopEvents.IS_INTERVENTION: is_intervention,     # "is_intervention"
+            TeleopEvents.SUCCESS: is_success_signal,           # "success"
+            TeleopEvents.RERECORD_EPISODE: is_reset_signal,    # "rerecord_episode"
+            TeleopEvents.TERMINATE_EPISODE: is_terminate_signal, # "terminate_episode"
+            TeleopEvents.START_RECORDING: is_start_signal,                
+            TeleopEvents.FAILURE: False
         }
 
     def get_action(self, observation: dict) -> torch.Tensor:

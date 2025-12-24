@@ -191,7 +191,7 @@ class MKRobot(Robot):
     def observation_features(self):
         """定义观测空间的数据结构"""
         features = {
-            "state": {
+            "observation.state": {
                 "dtype": "float32",
                 "shape": (7,),
                 "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
@@ -200,7 +200,7 @@ class MKRobot(Robot):
 
         # 【关键修改】：动态添加相机特征
         for cam_name in self.cameras:
-            features[f"images.{cam_name}"] = {
+            features[f"observation.images.{cam_name}"] = {
                 "dtype": "video",
                 "shape": (3, self.cameras[cam_name].config.height, self.cameras[cam_name].config.width),
                 "names": ["channels", "height", "width"],
@@ -289,7 +289,7 @@ class MKRobot(Robot):
     def get_observation(self) -> Dict[str, Any]:
         """返回的数据键名必须与上面 observation_features 的 Key 完全一致"""
         if not self.is_connected:
-            return {"state": torch.zeros(7)}
+            return {"observation.state": torch.zeros(7)}
 
         raw_obs = self.robot.get_observation()
         
@@ -304,7 +304,7 @@ class MKRobot(Robot):
 
         # 3. 组装字典
         obs_dict = {
-            "state": torch.from_numpy(q_sim).float(),
+            "observation.state": torch.from_numpy(q_sim).float(),
             # 兼容底层 Gym 环境需要的原始轴名
             "joint_1.pos": q_sim[0], "joint_2.pos": q_sim[1], "joint_3.pos": q_sim[2],
             "joint_4.pos": q_sim[3], "joint_5.pos": q_sim[4], "joint_6.pos": q_sim[5],
@@ -313,6 +313,6 @@ class MKRobot(Robot):
 
         # 4. 组装图像
         for cam_name, img in images.items():
-            obs_dict[f"images.{cam_name}"] = img
+            obs_dict[f"observation.images.{cam_name}"] = img
 
         return obs_dict
